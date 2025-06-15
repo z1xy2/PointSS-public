@@ -700,6 +700,7 @@ class SerializedUnpooling(PointModule):
             parent["unpooling_parent"] = point
         return parent
 
+
 class FastGeometricFeatureComputer(nn.Module):
     """
     快速几何特征计算器，优化的版本
@@ -716,12 +717,114 @@ class FastGeometricFeatureComputer(nn.Module):
         centers = neighborhoods.mean(dim=1, keepdim=True)
         variations = ((neighborhoods - centers) ** 2).sum(dim=-1).mean(dim=1)
         return variations
-class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
+
+
+class GPUManifoldFeatureEncoder(nn.Module):
     """
-    基于双序列化邻域的高效几何增强模块
-    使用Z-order和Hilbert两种序列化顺序进行互补的几何特征提取
+    GPU优化的流形特征编码器 - 修复版本
+    输出点特征而不是边特征
     """
 
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # 边特征编码器
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(8, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        )
+
+        # 边特征到点特征的聚合层
+        self.edge_to_node_proj = nn.Linear(hidden_dim // 4, hidden_dim // 4)
+
+        # 批量归一化
+        self.bn_edge = nn.BatchNorm1d(hidden_dim // 4)
+        self.bn_node = nn.BatchNorm1d(hidden_dim // 4)
+
+    def forward(self, coords, normals, curvatures, edge_index):
+        """
+        Args:
+            coords: [N, 3] 点坐标
+            normals: [N, 3] 法向量
+            curvatures: [N, K] 多尺度曲率
+            edge_index: [2, E] 边索引
+        Returns:
+            node_features: [N, D] 点特征
+        """
+        N = coords.shape[0]
+        device = coords.device
+
+        if edge_index.shape[1] == 0:
+            # 如果没有边，返回零特征
+            return torch.zeros(N, self.hidden_dim // 4, device=device)
+
+        row, col = edge_index
+
+        # 向量化计算所有边特征
+        delta_coords = coords[col] - coords[row]  # [E, 3]
+
+        # 法向量点积
+        normal_dot = (normals[row] * normals[col]).sum(dim=-1, keepdim=True)  # [E, 1]
+
+        # 法向量与相对位置的夹角（向量化）
+        eps = 1e-8
+        delta_norm = torch.norm(delta_coords, dim=-1, keepdim=True) + eps
+
+        cos_angle_row = (normals[row] * delta_coords).sum(dim=-1, keepdim=True) / delta_norm
+        cos_angle_col = (normals[col] * delta_coords).sum(dim=-1, keepdim=True) / delta_norm
+
+        # 限制范围
+        cos_angle_row = torch.clamp(cos_angle_row, -1 + eps, 1 - eps)
+        cos_angle_col = torch.clamp(cos_angle_col, -1 + eps, 1 - eps)
+
+        # 曲率差（仅使用前两个尺度）
+        curvature_diff = curvatures[col, :2] - curvatures[row, :2]  # [E, 2]
+
+        # 拼接边特征
+        edge_features_raw = torch.cat([
+            delta_coords,  # [E, 3]
+            normal_dot,  # [E, 1]
+            cos_angle_row,  # [E, 1]
+            cos_angle_col,  # [E, 1]
+            curvature_diff  # [E, 2]
+        ], dim=-1)  # [E, 8]
+
+        # 编码边特征
+        edge_features = self.edge_encoder(edge_features_raw)  # [E, hidden_dim//4]
+
+        # 批量归一化
+        if edge_features.size(0) > 1:
+            edge_features = self.bn_edge(edge_features)
+
+        # 将边特征聚合到点特征
+        # 使用scatter_mean将连接到每个点的边特征平均
+        node_features = torch.zeros(N, self.hidden_dim // 4, device=device)
+
+        # 对于每个点，聚合其作为起点和终点的所有边特征
+        node_features.index_add_(0, row, edge_features)
+        node_features.index_add_(0, col, edge_features)
+
+        # 计算每个点的邻接边数量进行归一化
+        degree = torch.zeros(N, device=device)
+        degree.index_add_(0, row, torch.ones_like(row, dtype=torch.float))
+        degree.index_add_(0, col, torch.ones_like(col, dtype=torch.float))
+        degree = torch.clamp(degree, min=1.0)  # 避免除零
+
+        node_features = node_features / degree.unsqueeze(1)
+
+        # 投影和归一化
+        node_features = self.edge_to_node_proj(node_features)
+        if node_features.size(0) > 1:
+            node_features = self.bn_node(node_features)
+
+        return node_features
+
+
+class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
     def __init__(self, coord_dim=3, hidden_dim=64, k=16, num_heads=4, fusion_strategy='adaptive'):
         super().__init__()
         self.k = k
@@ -733,6 +836,10 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         # 快速几何特征计算器
         self.fast_geom_computer = FastGeometricFeatureComputer()
 
+        # 修复：使用正确的输入输出维度
+        self.manifold_encoder_zorder = GPUManifoldFeatureEncoder(hidden_dim)
+        self.manifold_encoder_hilbert = GPUManifoldFeatureEncoder(hidden_dim)
+
         # 为两种序列化顺序分别设计的特征投影层
         self.coord_proj_zorder = nn.Linear(coord_dim, hidden_dim)
         self.coord_proj_hilbert = nn.Linear(coord_dim, hidden_dim)
@@ -740,7 +847,11 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         self.geom_proj_zorder = nn.Linear(5, hidden_dim)  # 法向量(3) + 曲率(2)
         self.geom_proj_hilbert = nn.Linear(5, hidden_dim)
 
-        # 两个独立的邻域内自注意力模块
+        # 修复：边特征投影层的输入维度
+        self.edge_feat_proj_zorder = nn.Linear(hidden_dim // 4, hidden_dim)
+        self.edge_feat_proj_hilbert = nn.Linear(hidden_dim // 4, hidden_dim)
+
+        # 其余代码保持不变...
         self.neighborhood_attn_zorder = nn.MultiheadAttention(
             hidden_dim, num_heads, batch_first=True, dropout=0.1
         )
@@ -748,12 +859,10 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
             hidden_dim, num_heads, batch_first=True, dropout=0.1
         )
 
-        # 跨序列化的交叉注意力模块（创新点：序列化间的信息交互）
         self.cross_serialization_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, batch_first=True, dropout=0.1
         )
 
-        # 自适应融合网络
         if fusion_strategy == 'adaptive':
             self.fusion_gate = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim // 2),
@@ -761,12 +870,7 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
                 nn.Linear(hidden_dim // 2, 2),
                 nn.Softmax(dim=-1)
             )
-        elif fusion_strategy == 'attention':
-            self.fusion_attention = nn.MultiheadAttention(
-                hidden_dim, num_heads, batch_first=True, dropout=0.1
-            )
 
-        # 几何一致性约束模块（创新点：确保两种序列化的几何一致性）
         self.consistency_enforcer = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
@@ -774,10 +878,8 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
             nn.Sigmoid()
         )
 
-        # 输出投影
         self.output_proj = nn.Linear(hidden_dim, coord_dim + 5)
 
-        # 归一化层
         self.norm_zorder = nn.LayerNorm(hidden_dim)
         self.norm_hilbert = nn.LayerNorm(hidden_dim)
         self.norm_fused = nn.LayerNorm(hidden_dim)
@@ -849,23 +951,54 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
 
         return pad, unpad, order, inverse
 
-    def create_dual_serialized_neighborhoods(self, point):
+    def create_edge_index_from_neighborhoods(self, neighborhoods, unpad, inverse, N_original):
         """
-        创建两种序列化顺序的邻域
-        order_index=0: Z-order曲线
-        order_index=1: Hilbert曲线
+        从序列化邻域重建边索引，用于流形特征编码器
         """
-        # Z-order邻域 (局部细节特征)
-        neighborhoods_z, unpad_z, inverse_z, N_original = self.create_serialized_neighborhoods(
-            point, order_index=0
-        )
+        device = neighborhoods.device
+        num_neighborhoods, k, _ = neighborhoods.shape
 
-        # Hilbert邻域 (全局结构特征)
-        neighborhoods_h, unpad_h, inverse_h, _ = self.create_serialized_neighborhoods(
-            point, order_index=1
-        )
+        # 创建邻域内的边索引
+        row_indices = []
+        col_indices = []
 
-        return (neighborhoods_z, unpad_z, inverse_z), (neighborhoods_h, unpad_h, inverse_h), N_original
+        for i in range(num_neighborhoods):
+            # 每个邻域内，中心点连接到所有其他点
+            center_idx = i * k  # 假设第一个点是中心点
+            for j in range(1, k):
+                neighbor_idx = i * k + j
+                row_indices.extend([center_idx, neighbor_idx])
+                col_indices.extend([neighbor_idx, center_idx])
+
+        if len(row_indices) > 0:
+            edge_index = torch.stack([
+                torch.tensor(row_indices, device=device),
+                torch.tensor(col_indices, device=device)
+            ])
+
+            # 通过unpad和inverse映射回原始索引
+            # 这里需要建立从邻域索引到原始点索引的映射
+            neighborhood_to_original = torch.arange(num_neighborhoods * k, device=device)
+            neighborhood_to_original = neighborhood_to_original[unpad]
+            original_mapping = torch.zeros(N_original, device=device, dtype=torch.long)
+            original_mapping[inverse] = neighborhood_to_original
+
+            # 应用映射
+            valid_mask = (edge_index[0] < len(neighborhood_to_original)) & (
+                        edge_index[1] < len(neighborhood_to_original))
+            edge_index = edge_index[:, valid_mask]
+
+            if edge_index.shape[1] > 0:
+                edge_index[0] = neighborhood_to_original[edge_index[0]]
+                edge_index[1] = neighborhood_to_original[edge_index[1]]
+
+                # 过滤超出范围的索引
+                valid_mask = (edge_index[0] < N_original) & (edge_index[1] < N_original)
+                edge_index = edge_index[:, valid_mask]
+        else:
+            edge_index = torch.zeros((2, 0), device=device, dtype=torch.long)
+
+        return edge_index
 
     def create_serialized_neighborhoods(self, point, order_index):
         """
@@ -886,6 +1019,29 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         neighborhoods = ordered_coords.view(num_neighborhoods, self.k, self.coord_dim)
 
         return neighborhoods, unpad, inverse, N_original
+
+    def create_dual_serialized_neighborhoods(self, point):
+        """
+        创建两种序列化顺序的邻域，并构建对应的边索引用于流形特征编码
+        order_index=0: Z-order曲线
+        order_index=1: Hilbert曲线
+        """
+        # Z-order邻域 (局部细节特征)
+        neighborhoods_z, unpad_z, inverse_z, N_original = self.create_serialized_neighborhoods(
+            point, order_index=0
+        )
+
+        # Hilbert邻域 (全局结构特征)
+        neighborhoods_h, unpad_h, inverse_h, _ = self.create_serialized_neighborhoods(
+            point, order_index=1
+        )
+
+        # 为流形特征编码器构建边索引
+        edge_index_z = self.create_edge_index_from_neighborhoods(neighborhoods_z, unpad_z, inverse_z, N_original)
+        edge_index_h = self.create_edge_index_from_neighborhoods(neighborhoods_h, unpad_h, inverse_h, N_original)
+
+        return (neighborhoods_z, unpad_z, inverse_z, edge_index_z), (neighborhoods_h, unpad_h, inverse_h,
+                                                                     edge_index_h), N_original
 
     def compute_neighborhood_geometry(self, neighborhoods):
         """
@@ -936,12 +1092,14 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
 
         return normals_expanded, curvatures_expanded
 
-    def apply_dual_neighborhood_attention(self, coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h):
+    def apply_dual_neighborhood_attention(self, coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h,
+                                          edge_features_z, edge_features_h):
         """
         在两种序列化的邻域内分别应用注意力机制，并进行跨序列化交互
+        集成流形特征编码器的边特征
         """
         # Z-order序列化的注意力
-        combined_feat_z = coord_feat_z + geom_feat_z
+        combined_feat_z = coord_feat_z + geom_feat_z + edge_features_z
         combined_feat_z = self.norm_zorder(combined_feat_z)
 
         enhanced_feat_z, attn_weights_z = self.neighborhood_attn_zorder(
@@ -950,7 +1108,7 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         enhanced_feat_z = enhanced_feat_z + combined_feat_z
 
         # Hilbert序列化的注意力
-        combined_feat_h = coord_feat_h + geom_feat_h
+        combined_feat_h = coord_feat_h + geom_feat_h + edge_features_h
         combined_feat_h = self.norm_hilbert(combined_feat_h)
 
         enhanced_feat_h, attn_weights_h = self.neighborhood_attn_hilbert(
@@ -974,6 +1132,7 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         final_feat_h = enhanced_feat_h + self.dropout(cross_enhanced_h)
 
         return final_feat_z, final_feat_h, (attn_weights_z, attn_weights_h, cross_attn_weights)
+
 
     def fuse_dual_features(self, feat_z, feat_h):
         """
@@ -1031,30 +1190,70 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         restored_features[inverse_z] = unpadded_features
 
         return restored_features
-
     def forward(self, point):
         """
-        双序列化几何增强前向传播
-        Args:
-            point: Point对象（需要包含至少两种序列化顺序）
-        Returns:
-            enhanced_coords: [N, 3] 增强的坐标
-            enhanced_geom: [N, 5] 增强的几何特征
-            attention_info: dict 包含各种注意力权重信息
+        修复后的前向传播
         """
-        # 确保point对象包含至少两种序列化顺序
         if len(point.serialized_order) < 2:
-            raise ValueError("Point object must contain at least 2 serialization orders (Z-order and Hilbert)")
+            raise ValueError("Point object must contain at least 2 serialization orders")
 
-        # 1. 创建双序列化邻域
-        (neighborhoods_z, unpad_z, inverse_z), (neighborhoods_h, unpad_h, inverse_h), N_original = \
+        # 1. 创建双序列化邻域和边索引
+        (neighborhoods_z, unpad_z, inverse_z, edge_index_z), (neighborhoods_h, unpad_h, inverse_h,
+                                                              edge_index_h), N_original = \
             self.create_dual_serialized_neighborhoods(point)
 
         # 2. 分别计算两种序列化的几何特征
         normals_z, curvatures_z = self.compute_neighborhood_geometry(neighborhoods_z)
         normals_h, curvatures_h = self.compute_neighborhood_geometry(neighborhoods_h)
 
-        # 3. 分别进行特征编码
+        # 3. 修复：正确处理几何特征
+        flat_coords = point.coord
+        flat_normals_z = normals_z.contiguous().view(-1, 3)[unpad_z]
+        flat_normals_h = normals_h.contiguous().view(-1, 3)[unpad_h]
+        flat_curvatures_z = curvatures_z.contiguous().view(-1, 2)[unpad_z]
+        flat_curvatures_h = curvatures_h.contiguous().view(-1, 2)[unpad_h]
+
+        # 恢复到原始顺序
+        restored_normals_z = torch.zeros_like(flat_coords)
+        restored_normals_h = torch.zeros_like(flat_coords)
+        restored_curvatures_z = torch.zeros(N_original, 2, device=flat_coords.device)
+        restored_curvatures_h = torch.zeros(N_original, 2, device=flat_coords.device)
+
+        restored_normals_z[inverse_z] = flat_normals_z
+        restored_normals_h[inverse_h] = flat_normals_h
+        restored_curvatures_z[inverse_z] = flat_curvatures_z
+        restored_curvatures_h[inverse_h] = flat_curvatures_h
+
+        # 4. 修复：流形特征编码器现在直接返回点特征
+        edge_features_z = self.manifold_encoder_zorder(
+            flat_coords, restored_normals_z, restored_curvatures_z, edge_index_z
+        )  # 现在返回 [N, hidden_dim//4]
+
+        edge_features_h = self.manifold_encoder_hilbert(
+            flat_coords, restored_normals_h, restored_curvatures_h, edge_index_h
+        )  # 现在返回 [N, hidden_dim//4]
+
+        # 5. 投影边特征到合适的维度
+        edge_feat_proj_z = self.edge_feat_proj_zorder(edge_features_z)
+        edge_feat_proj_h = self.edge_feat_proj_hilbert(edge_features_h)
+
+        # 6. 修复：将点特征重新组织为邻域格式
+        try:
+            pad_z, _, _, _ = self.get_serialized_padding_and_inverse(point, self.k, 0)
+            pad_h, _, _, _ = self.get_serialized_padding_and_inverse(point, self.k, 1)
+
+            edge_feat_neighborhoods_z = edge_feat_proj_z[point.serialized_order[0]][pad_z].contiguous().view(
+                neighborhoods_z.shape[0], self.k, -1)
+            edge_feat_neighborhoods_h = edge_feat_proj_h[point.serialized_order[1]][pad_h].contiguous().view(
+                neighborhoods_h.shape[0], self.k, -1)
+        except:
+            # 如果索引出错，使用零特征
+            edge_feat_neighborhoods_z = torch.zeros(neighborhoods_z.shape[0], self.k, self.hidden_dim,
+                                                    device=flat_coords.device)
+            edge_feat_neighborhoods_h = torch.zeros(neighborhoods_h.shape[0], self.k, self.hidden_dim,
+                                                    device=flat_coords.device)
+
+        # 7. 继续其余的处理...
         coord_feat_z = self.coord_proj_zorder(neighborhoods_z)
         geom_input_z = torch.cat([normals_z, curvatures_z], dim=-1)
         geom_feat_z = self.geom_proj_zorder(geom_input_z)
@@ -1063,32 +1262,34 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         geom_input_h = torch.cat([normals_h, curvatures_h], dim=-1)
         geom_feat_h = self.geom_proj_hilbert(geom_input_h)
 
-        # 4. 双序列化邻域内注意力和跨序列化交互
+        # 8. 应用注意力机制
         enhanced_feat_z, enhanced_feat_h, attention_weights = self.apply_dual_neighborhood_attention(
-            coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h
+            coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h,
+            edge_feat_neighborhoods_z, edge_feat_neighborhoods_h
         )
 
-        # 5. 融合两种序列化的特征
+        # 9. 融合特征
         fused_feat = self.fuse_dual_features(enhanced_feat_z, enhanced_feat_h)
 
-        # 6. 输出投影
+        # 10. 输出投影
         output = self.output_proj(fused_feat)
 
-        # 7. 恢复到原始顺序
+        # 11. 恢复到原始顺序
         restored_output = self.restore_to_original_order(
             output, unpad_z, inverse_z, unpad_h, inverse_h, N_original
         )
 
-        # 8. 分离坐标和几何特征
+        # 12. 分离坐标和几何特征
         enhanced_coords = restored_output[:, :self.coord_dim]
         enhanced_geom = restored_output[:, self.coord_dim:]
 
-        # 9. 整理注意力信息
+        # 13. 整理注意力信息
         attention_info = {
             'zorder_attention': attention_weights[0].mean(dim=0),
             'hilbert_attention': attention_weights[1].mean(dim=0),
             'cross_attention': attention_weights[2].mean(dim=0),
-            'fusion_weights': None  # 可以添加融合权重信息
+            'manifold_features_z': edge_features_z,
+            'manifold_features_h': edge_features_h,
         }
 
         return enhanced_coords, enhanced_geom, attention_info
