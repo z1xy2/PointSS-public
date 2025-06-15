@@ -18,6 +18,7 @@ import pdb
 import open3d as o3d
 import logging
 import numpy as np
+
 try:
     import flash_attn
 except ImportError:
@@ -34,6 +35,7 @@ from torch_scatter import scatter_mean, scatter_max, scatter_add, scatter_softma
 from pointcept.models.utils import offset2batch, batch2offset
 from pointcept.models.utils.serialization import encode, decode
 
+
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
         super().__init__()
@@ -46,14 +48,15 @@ class RPE(torch.nn.Module):
 
     def forward(self, coord):
         idx = (
-            coord.clamp(-self.pos_bnd, self.pos_bnd)  # clamp into bnd
-            + self.pos_bnd  # relative position to positive index
-            + torch.arange(3, device=coord.device) * self.rpe_num  # x, y, z stride
+                coord.clamp(-self.pos_bnd, self.pos_bnd)  # clamp into bnd
+                + self.pos_bnd  # relative position to positive index
+                + torch.arange(3, device=coord.device) * self.rpe_num  # x, y, z stride
         )
         out = self.rpe_table.index_select(0, idx.reshape(-1))
         out = out.view(idx.shape + (-1,)).sum(3)
         out = out.permute(0, 3, 1, 2)  # (N, K, K, H) -> (N, H, K, K)
         return out
+
 
 def cyclic_counter(max_value):
     """生成一个循环递增的数列，从0开始到max_value-1，然后重置为0。"""
@@ -65,67 +68,65 @@ def cyclic_counter(max_value):
             count = 0
 
 
-
 class SerializedAttention(PointModule):
-    enc_order_prompt_proj=[]
-    dec_order_prompt_proj=[]
-    order_prompt=None
-    per_layer_prompt_indexe=None
-    prompt_num_per_order = 6 #位置编码数量
-    order_name={"z":0, "z-trans":1, "hilbert":2, "hilbert-trans":3}
+    enc_order_prompt_proj = []
+    dec_order_prompt_proj = []
+    order_prompt = None
+    per_layer_prompt_indexe = None
+    prompt_num_per_order = 6  # 位置编码数量
+    order_name = {"z": 0, "z-trans": 1, "hilbert": 2, "hilbert-trans": 3}
+
     @staticmethod
     def static_init(enc_channels, dec_channels,
-                    use_order_prompt=True,  #是否使用位置编码
+                    use_order_prompt=True,  # 是否使用位置编码
                     mamba_layers_orders=["z", "z-trans", "hilbert", "hilbert-trans"]):
-        prompt_num_per_order=SerializedAttention.prompt_num_per_order
+        prompt_num_per_order = SerializedAttention.prompt_num_per_order
         if use_order_prompt:
             for i in enc_channels:
-                SerializedAttention.enc_order_prompt_proj.append(nn.Linear(384, i, bias=False).cuda())  # 将位置编码feat映射为out_channel
-            #使用位置編碼
-
+                SerializedAttention.enc_order_prompt_proj.append(
+                    nn.Linear(384, i, bias=False).cuda())  # 将位置编码feat映射为out_channel
+            # 使用位置編碼
 
             # learnable embeddings for per order, channel is 384
-            unique_order = list(set(mamba_layers_orders))#将mamba_layers_orders打乱排序，感觉没啥用
+            unique_order = list(set(mamba_layers_orders))  # 将mamba_layers_orders打乱排序，感觉没啥用
             overall_prompt_nums = len(unique_order) * prompt_num_per_order
             # Embedding层将一个数字直接转化为你想要的维度的向量，就是order_prompt
             SerializedAttention.order_prompt = nn.Embedding(overall_prompt_nums, 384).cuda()
-            #{'hilbert': [6, 12], 'hilbert-trans': [18, 24], 'z': [12, 18], 'z-trans': [0, 6]} 每次运行还不太一样
-            #{'hilbert': [0, 6], 'hilbert-trans': [6, 12], 'z': [18, 24], 'z-trans': [12, 18]}
+            # {'hilbert': [6, 12], 'hilbert-trans': [18, 24], 'z': [12, 18], 'z-trans': [0, 6]} 每次运行还不太一样
+            # {'hilbert': [0, 6], 'hilbert-trans': [6, 12], 'z': [18, 24], 'z-trans': [12, 18]}
             order2idx = {order: [i * prompt_num_per_order, (i + 1) * prompt_num_per_order]
                          for i, order in enumerate(unique_order)}  # 为每个order分配6个索引
             SerializedAttention.per_layer_prompt_indexe = []
             for order in mamba_layers_orders:
                 SerializedAttention.per_layer_prompt_indexe.append(order2idx[order])  # 根据order在数组中的顺序，将索引存入数组
 
-
             for i in dec_channels:
-                SerializedAttention.dec_order_prompt_proj.append(nn.Linear(384, i, bias=False).cuda())  # 将位置编码feat映射为out_channel
-
-
+                SerializedAttention.dec_order_prompt_proj.append(
+                    nn.Linear(384, i, bias=False).cuda())  # 将位置编码feat映射为out_channel
 
     def __init__(
-        self,
-        is_enc,
-        layer_idx,
-        channels,
-        num_heads,
-        patch_size,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        order_index=0,
-        enable_rpe=False,
-        enable_flash=True,
-        upcast_attention=True,
-        upcast_softmax=True,
-        area_num=2,
+            self,
+            is_enc,
+            layer_idx,
+            channels,
+            num_heads,
+            patch_size,
+            qkv_bias=True,
+            qk_scale=None,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            order_index=0,
+            enable_rpe=False,
+            enable_flash=True,
+            upcast_attention=True,
+            upcast_softmax=True,
+            area_num=2,
 
     ):
         super().__init__()
         assert channels % num_heads == 0
-        self.is_enc=is_enc
-        self.layer_idx=layer_idx
+        self.is_enc = is_enc
+        self.layer_idx = layer_idx
         self.channels = channels
         self.num_heads = num_heads
         self.scale = qk_scale or (channels // num_heads) ** -0.5
@@ -137,13 +138,13 @@ class SerializedAttention(PointModule):
         self.area_num = area_num
         if enable_flash:
             assert (
-                enable_rpe is False
+                    enable_rpe is False
             ), "Set enable_rpe to False when enable Flash Attention"
             assert (
-                upcast_attention is False
+                    upcast_attention is False
             ), "Set upcast_attention to False when enable Flash Attention"
             assert (
-                upcast_softmax is False
+                    upcast_softmax is False
             ), "Set upcast_softmax to False when enable Flash Attention"
             assert flash_attn is not None, "Make sure flash_attn is installed."
             self.current_patch_size = patch_size
@@ -160,33 +161,34 @@ class SerializedAttention(PointModule):
 
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
         1
-        self.proj = torch.nn.Linear(2*channels, channels)#进行了修改
+        self.proj = torch.nn.Linear(2 * channels, channels)  # 进行了修改
 
         self.proj_drop = torch.nn.Dropout(proj_drop)
-        self.mlp=MLP(channels,channels)
+        self.mlp = MLP(channels, channels)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
         self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
-                                # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                bimamba_type='v2',
-                                norm_cls=partial( RMSNorm, eps=1e-5,), fused_add_norm=True,
-                                residual_in_fp32=True,
-                                drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                 bimamba_type='v2',
+                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                 residual_in_fp32=True,
+                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
         self.mamba1 = MambaBlock(dim=channels, layer_idx=None,
-                                # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                bimamba_type='v2',
-                                norm_cls=partial( RMSNorm, eps=1e-5,), fused_add_norm=True,
-                                residual_in_fp32=True,
-                                drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                 bimamba_type='v2',
+                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                 residual_in_fp32=True,
+                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
         self.mamba2 = MambaBlock(dim=channels, layer_idx=None,
-                                # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                bimamba_type='v2',
-                                norm_cls=partial( RMSNorm, eps=1e-5,), fused_add_norm=True,
-                                residual_in_fp32=True,
-                                drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                 bimamba_type='v2',
+                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                 residual_in_fp32=True,
+                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+
     @torch.no_grad()
     def get_rel_pos(self, point, order):
         K = self.current_patch_size
@@ -197,7 +199,7 @@ class SerializedAttention(PointModule):
             point[rel_pos_key] = grid_coord.unsqueeze(2) - grid_coord.unsqueeze(1)
         return point[rel_pos_key]
 
-    def create_filled_tensor(self,length, range_end):#todo:转为cpu形式，再验证一下正确性
+    def create_filled_tensor(self, length, range_end):  # todo:转为cpu形式，再验证一下正确性
         # 计算基本的重复次数和额外需要分配的元素数
         base_count = length // range_end
         remainder = length % range_end
@@ -214,10 +216,10 @@ class SerializedAttention(PointModule):
         return final_tensor
 
     @torch.no_grad()
-    def get_padding_and_inverse( self,point, config_patch_size,mamba_number):
-        pad_key = "pad"+str(mamba_number)
-        unpad_key = "unpad"+str(mamba_number)
-        cu_seqlens_key = "cu_seqlens_key"+str(mamba_number)
+    def get_padding_and_inverse(self, point, config_patch_size, mamba_number):
+        pad_key = "pad" + str(mamba_number)
+        unpad_key = "unpad" + str(mamba_number)
+        cu_seqlens_key = "cu_seqlens_key" + str(mamba_number)
         # 检查键值：函数首先检查point字典中是否已经存在pad、unpad和cu_seqlens_key键。如果这些键都存在，则不需要重新计算它们。
         if (
                 pad_key not in point.keys()
@@ -227,7 +229,6 @@ class SerializedAttention(PointModule):
 
             offset = point.offset
             bincount = offset2bincount(offset)  # 每一个batch中的点数量
-
 
             # ====填充计算：======
             bincount_pad = (  # 对每个batch的元素数量进行向上取整到最近的patch_size的倍数，确保每个块的大小都是patch_size的整数倍。
@@ -258,16 +259,17 @@ class SerializedAttention(PointModule):
                 # 这一步调整逆填充（unpad）数组，确保经过填充后的序列能够反映回原始序列的位置。（？？？？）
                 # 对于每个批次，它基于原始偏移（_offset）和经过填充调整后的偏移（_offset_pad）之间的差值，
                 # _offset[i] : _offset[i + 1]取第i个batch的点，加上该batch填充了的点
-                unpad[_offset[i]: _offset[i + 1]] += _offset_pad[i] - _offset[i]  # 计算unpad_key，是统一对batch的操作，不需要额外修改，每个batch都会用到
-                if(bincount[i]<config_patch_size):#如果这一batch的点数量不足以形成一个patch，那就将该batch的点重复。
-                    count_per_element =bincount[i]
-                    this_batch_pad_count= _offset_pad[i + 1] - _offset_pad[i]
+                unpad[_offset[i]: _offset[i + 1]] += _offset_pad[i] - _offset[
+                    i]  # 计算unpad_key，是统一对batch的操作，不需要额外修改，每个batch都会用到
+                if (bincount[i] < config_patch_size):  # 如果这一batch的点数量不足以形成一个patch，那就将该batch的点重复。
+                    count_per_element = bincount[i]
+                    this_batch_pad_count = _offset_pad[i + 1] - _offset_pad[i]
                     result = self.create_filled_tensor(this_batch_pad_count, count_per_element)
-                    pad[_offset_pad[i ]:_offset_pad[i + 1]]=result+_offset_pad[i]
+                    pad[_offset_pad[i]:_offset_pad[i + 1]] = result + _offset_pad[i]
                 else:
                     # 如果bincount[i]（原始批次中的点数）与bincount_pad[i]（调整后的点数）不相等，说明该batch的点数不能被patch_size整除，需要特殊处理：
                     # 将倒数第二个patch_size的后面一部分索引填充到最后一个patch_size的padding的部分，因为这些点是最邻近的，见思源
-                    if bincount[i] != bincount_pad[i]:#如果需要填充,填充与原版ptv3略有区别
+                    if bincount[i] != bincount_pad[i]:  # 如果需要填充,填充与原版ptv3略有区别
                         # pad[  # 填充位的点云变为
                         #     _offset_pad[i + 1]
                         #     - current_patch_size
@@ -279,20 +281,19 @@ class SerializedAttention(PointModule):
                         #         + (bincount[i] % current_patch_size): _offset_pad[i + 1]
                         #                                                 - current_patch_size
                         # ]
-                        new_pad=pad.clone()#新建，用于为pad赋值。
+                        new_pad = pad.clone()  # 新建，用于为pad赋值。
                         # 最后一组填充仍然保持顺序
                         pad[
-                        _offset_pad[i + 1]
-                        - config_patch_size
+                            _offset_pad[i + 1]
+                            - config_patch_size
                             : _offset_pad[i + 1]
-                            ] = new_pad[
+                        ] = new_pad[
 
-                                _offset_pad[i + 1]
-                                - 2 * config_patch_size
-                                + (bincount[i] % config_patch_size): _offset_pad[i + 1]
-                                                        - config_patch_size + (bincount[i] % config_patch_size)
+                            _offset_pad[i + 1]
+                            - 2 * config_patch_size
+                            + (bincount[i] % config_patch_size): _offset_pad[i + 1]
+                                                                 - config_patch_size + (bincount[i] % config_patch_size)
                         ]
-
 
                 # 更新填充（pad）数组，调整填充后序列中的索引，以确保它们正确反映原始数据中的位置。原本的pad，除了第一个batch，后面的batch都无法索引原数组，
                 # 因为pad的原因，每个batch都是pad过后的编号，比如每个batch都是整数patch_size开头。
@@ -326,57 +327,59 @@ class SerializedAttention(PointModule):
 
         H = self.num_heads
         K = self.current_patch_size
-        C = self.channels #通道数
-        #已完成：动态patch，每个batch的点数量都大于patch_size时，patch_size为我们预先设置好的最大值，也就是self.patch_size
-        #已完成：有任何一个batch的点连一个patch_size都不到，那么patch_size就是这个batch的点数。
-        #===========顺序特征================
-        pad, unpad, cu_seqlens = self.get_padding_and_inverse(point,K,0)
+        C = self.channels  # 通道数
+        # 已完成：动态patch，每个batch的点数量都大于patch_size时，patch_size为我们预先设置好的最大值，也就是self.patch_size
+        # 已完成：有任何一个batch的点连一个patch_size都不到，那么patch_size就是这个batch的点数。
+        # ===========顺序特征================
+        pad, unpad, cu_seqlens = self.get_padding_and_inverse(point, K, 0)
         # print("---------------------------------------------------------------------")
         # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
-        ordered_and_padded_points_feat=point.feat[order] #排序后和padding后的点云特征。
+        ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
         x = ordered_and_padded_points_feat.reshape(-1, K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-        x_res=None
-        #进行order prompt,todo：顺序提示需要给出当前编码顺序
-        sort_name=point.sort_name[self.order_index]# 取出第i个顺序提示的名称
-        layer_order_prompt_indexes = self.per_layer_prompt_indexe[self.order_name[sort_name]]  # 根据名称取出第i个顺序提示的prompt的index
+        x_res = None
+        # 进行order prompt,todo：顺序提示需要给出当前编码顺序
+        sort_name = point.sort_name[self.order_index]  # 取出第i个顺序提示的名称
+        layer_order_prompt_indexes = self.per_layer_prompt_indexe[
+            self.order_name[sort_name]]  # 根据名称取出第i个顺序提示的prompt的index
 
         layer_order_prompt = self.order_prompt.weight[  # order_prompt.weight:[54,384]，54是所有的顺序提示的数量，384是每个顺序提示的维度
-                             layer_order_prompt_indexes[0]: layer_order_prompt_indexes[1]]  # 将这组的位置提示的MLP（权重）取出来
+            layer_order_prompt_indexes[0]: layer_order_prompt_indexes[1]]  # 将这组的位置提示的MLP（权重）取出来
         if self.is_enc:
             layer_order_prompt_proj = self.enc_order_prompt_proj[self.layer_idx]
         else:
             layer_order_prompt_proj = self.dec_order_prompt_proj[self.layer_idx]
-        layer_order_prompt=layer_order_prompt_proj(layer_order_prompt)
+        layer_order_prompt = layer_order_prompt_proj(layer_order_prompt)
         layer_order_prompt = layer_order_prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
         x = torch.cat([layer_order_prompt, x, layer_order_prompt], dim=1)  # 很神奇，将顺序提示当做点给添加进去了，前面六个点，后面六个点，实际都是顺序提示
-        x,x_res=self.mamba0(x,x_res) #todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+        x, x_res = self.mamba0(x, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
         x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]  # 出来时将前后的顺序提示去掉
-        x=x.reshape(-1, C) #返回为非patch的情况
-        feat0 = x[inverse]#将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        x = x.reshape(-1, C)  # 返回为非patch的情况
+        feat0 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
 
-        #=============================引入随机全局特征4================================
-        pad_4, unpad_4, cu_seqlens_4 = self.get_padding_and_inverse(point, K,1)
+        # =============================引入随机全局特征4================================
+        pad_4, unpad_4, cu_seqlens_4 = self.get_padding_and_inverse(point, K, 1)
 
         # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
         order = point.serialized_order[self.order_index][pad_4]
         inverse = unpad_4[point.serialized_inverse[self.order_index]]
-        ordered_and_padded_points_feat=point.feat[order] #排序后和padding后的点云特征。
+        ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
         x = ordered_and_padded_points_feat.reshape(-1, K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-        x_res=None
+        x_res = None
 
-        #打乱同patch的特征
-        shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()#打乱后的下标
+        # 打乱同patch的特征
+        shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()  # 打乱后的下标
         inverse_shuffle_one_patch_indices = torch.empty_like(shuffle_one_patch_indices)
-        inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(x.shape[1]).cuda()#打乱后将点云返还原来顺序，所需的反向下标
+        inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(
+            x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
         x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
 
-        x_shuffled,x_res=self.mamba1(x_shuffled,x_res) #todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
-        x=x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
+        x_shuffled, x_res = self.mamba1(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+        x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
 
-        x=x.reshape(-1, C) #返回为非patch的情况
-        feat1 = x[inverse]#将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        x = x.reshape(-1, C)  # 返回为非patch的情况
+        feat1 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
 
         # # =============================引入随机全局特征16================================
         # pad_16, unpad_16, cu_seqlens_16 = self.get_padding_and_inverse(point, 6 * K,2)
@@ -401,12 +404,12 @@ class SerializedAttention(PointModule):
         # x = x.reshape(-1, C)  # 返回为非patch的情况
         # feat2 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
 
-        feat=torch.concat([feat0,feat1],1)
+        feat = torch.concat([feat0, feat1], 1)
 
         # ffn
         feat = self.proj(feat)
 
-        feat=self.mlp(feat)
+        feat = self.mlp(feat)
 
         feat = self.proj_drop(feat)
         point.feat = feat
@@ -415,12 +418,12 @@ class SerializedAttention(PointModule):
 
 class MLP(nn.Module):
     def __init__(
-        self,
-        in_channels,
-        hidden_channels=None,
-        out_channels=None,
-        act_layer=nn.GELU,
-        drop=0.0,
+            self,
+            in_channels,
+            hidden_channels=None,
+            out_channels=None,
+            act_layer=nn.GELU,
+            drop=0.0,
     ):
         super().__init__()
         out_channels = out_channels or in_channels
@@ -440,31 +443,32 @@ class MLP(nn.Module):
 
 
 class Block(PointModule):
-    time_cost=0
-    count=0
+    time_cost = 0
+    count = 0
+
     def __init__(
-        self,
-        is_enc,
-        layer_idx,#第几号编码器/解码器
-        channels,
-        num_heads,
-        patch_size=48,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        drop_path=0.0,
-        norm_layer=nn.LayerNorm,
-        act_layer=nn.GELU,
-        pre_norm=True,
-        order_index=0,
-        cpe_indice_key=None,
-        enable_rpe=False,
-        enable_flash=True,
-        upcast_attention=True,
-        upcast_softmax=True,
-            drop_path_rate=0.1,#新增
+            self,
+            is_enc,
+            layer_idx,  # 第几号编码器/解码器
+            channels,
+            num_heads,
+            patch_size=48,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            qk_scale=None,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            drop_path=0.0,
+            norm_layer=nn.LayerNorm,
+            act_layer=nn.GELU,
+            pre_norm=True,
+            order_index=0,
+            cpe_indice_key=None,
+            enable_rpe=False,
+            enable_flash=True,
+            upcast_attention=True,
+            upcast_softmax=True,
+            drop_path_rate=0.1,  # 新增
     ):
         super().__init__()
         self.channels = channels
@@ -484,10 +488,10 @@ class Block(PointModule):
 
         self.norm1 = PointSequential(norm_layer(channels))
 
-        #================================修改的代码=============================
+        # ================================修改的代码=============================
         # self.latecyLogger=logging.getLogger("b3-p128-trans")
 
-        #自添加mamba
+        # 自添加mamba
         self.attn = SerializedAttention(
             is_enc,
             layer_idx,
@@ -528,11 +532,11 @@ class Block(PointModule):
         # x, x_res = self.mamba(x, x_res)
 
         time_start = datetime.datetime.now()
-        point=self.attn(point)
+        point = self.attn(point)
         time_end = datetime.datetime.now()
-        time_latecy=time_end - time_start
+        time_latecy = time_end - time_start
 
-        self.count+=1
+        self.count += 1
         # self.latecyLogger.info(time_latecy)
 
         point = self.drop_path(point)
@@ -553,15 +557,15 @@ class Block(PointModule):
 
 class SerializedPooling(PointModule):
     def __init__(
-        self,
-        in_channels,
-        out_channels,
-        stride=2,
-        norm_layer=None,
-        act_layer=None,
-        reduce="max",
-        shuffle_orders=True,
-        traceable=True,  # record parent and cluster
+            self,
+            in_channels,
+            out_channels,
+            stride=2,
+            norm_layer=None,
+            act_layer=None,
+            reduce="max",
+            shuffle_orders=True,
+            traceable=True,  # record parent and cluster
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -661,13 +665,13 @@ class SerializedPooling(PointModule):
 
 class SerializedUnpooling(PointModule):
     def __init__(
-        self,
-        in_channels,
-        skip_channels,
-        out_channels,
-        norm_layer=None,
-        act_layer=None,
-        traceable=False,  # record parent and cluster
+            self,
+            in_channels,
+            skip_channels,
+            out_channels,
+            norm_layer=None,
+            act_layer=None,
+            traceable=False,  # record parent and cluster
     ):
         super().__init__()
         self.proj = PointSequential(nn.Linear(in_channels, out_channels))
@@ -697,12 +701,11 @@ class SerializedUnpooling(PointModule):
         return parent
 
 
-
-
 class GPUCurvatureComputer(nn.Module):
     """
     GPU版本的曲率计算器 - 完全向量化优化版
     """
+
     def __init__(self, k_scales=[15, 30], eps=1e-8):
         super().__init__()
         self.k_scales = k_scales
@@ -778,7 +781,7 @@ class GPUCurvatureComputer(nn.Module):
             eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrices)
 
             # 法向量是对应最小特征值的特征向量
-            normals = eigenvectors[:, :, 0] # [N, 3]
+            normals = eigenvectors[:, :, 0]  # [N, 3]
 
             # 处理邻居数不足的点，给一个默认法向量
             default_normal = torch.tensor([0, 0, 1.0], device=device, dtype=coords.dtype)
@@ -805,8 +808,8 @@ class GPUCurvatureComputer(nn.Module):
 
         # 3. 向量化计算法向量差异的协方差矩阵
         # 这一步也可以用scatter_mean简化，但为了与法向量计算保持一致，我们手动计算
-        outer_products = normal_diff.unsqueeze(2) * normal_diff.unsqueeze(1) # [E, 3, 3]
-        cov_matrices = scatter_add(outer_products, row, dim=0, dim_size=N)   # [N, 3, 3]
+        outer_products = normal_diff.unsqueeze(2) * normal_diff.unsqueeze(1)  # [E, 3, 3]
+        cov_matrices = scatter_add(outer_products, row, dim=0, dim_size=N)  # [N, 3, 3]
 
         # 归一化
         neighbor_counts = scatter_add(torch.ones_like(row), row, dim=0, dim_size=N)
@@ -816,8 +819,8 @@ class GPUCurvatureComputer(nn.Module):
 
         # 4. 计算曲率 (协方差矩阵的迹)
         # torch.einsum比手动diag和sum更高效
-        curvatures = torch.einsum('nii->n', cov_matrices) # [N]
-        curvatures[~valid_mask] = 0.0 # 无效点曲率为0
+        curvatures = torch.einsum('nii->n', cov_matrices)  # [N]
+        curvatures[~valid_mask] = 0.0  # 无效点曲率为0
 
         return curvatures
 
@@ -826,6 +829,7 @@ class EfficientDynamicGraphBuilder(nn.Module):
     """
     高效的动态图构建模块 - GPU优化版本
     """
+
     def __init__(self, coord_dim=3, hidden_dim=32, k_min=8, k_max=32):
         super().__init__()
         self.k_min = k_min
@@ -865,6 +869,7 @@ class GPUManifoldFeatureEncoder(nn.Module):
     """
     GPU优化的流形特征编码器
     """
+
     def __init__(self, hidden_dim=64):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -915,11 +920,11 @@ class GPUManifoldFeatureEncoder(nn.Module):
 
         # 拼接边特征
         edge_features_raw = torch.cat([
-            delta_coords,      # [E, 3]
-            normal_dot,        # [E, 1]
-            cos_angle_row,     # [E, 1]
-            cos_angle_col,     # [E, 1]
-            curvature_diff     # [E, 2]
+            delta_coords,  # [E, 3]
+            normal_dot,  # [E, 1]
+            cos_angle_row,  # [E, 1]
+            cos_angle_col,  # [E, 1]
+            curvature_diff  # [E, 2]
         ], dim=-1)  # [E, 8]
 
         # 编码边特征
@@ -936,6 +941,7 @@ class FastGraphAttentionLayer(nn.Module):
     """
     高效的图注意力层 - GPU优化版本
     """
+
     def __init__(self, input_dim, hidden_dim, output_dim, num_heads=4, use_bias=False):
         super().__init__()
         self.num_heads = num_heads
@@ -999,6 +1005,7 @@ class AdaptiveFusionGate(nn.Module):
     """
     轻量级自适应融合门
     """
+
     def __init__(self, feature_dim, gate_dim=16):
         super().__init__()
 
@@ -1032,6 +1039,7 @@ class OptimizedDynamicAtlasAttention(nn.Module):
     """
     GPU优化的动态图谱注意力模块
     """
+
     def __init__(self, coord_dim=3, hidden_dim=128, num_heads=8, k_min=8, k_max=32):
         super().__init__()
 
@@ -1039,8 +1047,8 @@ class OptimizedDynamicAtlasAttention(nn.Module):
         self.curvature_computer = GPUCurvatureComputer(k_scales=[15, 30])
 
         # 优化的子模块
-        self.graph_builder = EfficientDynamicGraphBuilder(coord_dim, hidden_dim//4, k_min, k_max)
-        self.manifold_encoder = GPUManifoldFeatureEncoder(hidden_dim//2)
+        self.graph_builder = EfficientDynamicGraphBuilder(coord_dim, hidden_dim // 4, k_min, k_max)
+        self.manifold_encoder = GPUManifoldFeatureEncoder(hidden_dim // 2)
 
         # 特征投影
         self.pos_proj = nn.Linear(coord_dim, hidden_dim)
@@ -1107,121 +1115,372 @@ class OptimizedDynamicAtlasAttention(nn.Module):
         return enhanced_features, fusion_weights, k_per_point
 
 
-class Embedding(PointModule):
+class SerializedNeighborhoodGeometricEnhancement(nn.Module):
     """
-    GPU优化的增强嵌入模块
+    基于序列化邻域的高效几何增强模块
+    避免KNN操作，使用序列化顺序构建邻域
     """
-    def __init__(self, in_channels, embed_channels, norm_layer=None, act_layer=None):
+
+    def __init__(self, coord_dim=3, hidden_dim=64, k=16, num_heads=4):
+        super().__init__()
+        self.k = k  # 邻域大小
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.coord_dim = coord_dim
+
+        # 快速几何特征计算器
+        self.fast_geom_computer = FastGeometricFeatureComputer()
+
+        # 特征投影层
+        self.coord_proj = nn.Linear(coord_dim, hidden_dim)
+        self.geom_proj = nn.Linear(5, hidden_dim)  # 法向量(3) + 曲率(2)
+
+        # 邻域内自注意力
+        self.neighborhood_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True, dropout=0.1
+        )
+
+        # 输出投影
+        self.output_proj = nn.Linear(hidden_dim, coord_dim + 5)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def get_serialized_padding_and_inverse(self, point, k, order_index):
+        """
+        复用编码器的padding逻辑，针对序列化邻域优化
+        """
+        # 获取序列化后的点云顺序
+        order = point.serialized_order[order_index]
+        inverse = point.serialized_inverse[order_index]
+
+        offset = point.offset
+        bincount = torch.diff(offset, prepend=torch.tensor([0], device=offset.device))
+
+        # 计算每个batch需要padding到k的倍数
+        bincount_pad = (
+                torch.div(bincount + k - 1, k, rounding_mode="trunc") * k
+        )
+
+        # 只对点数大于k的batch进行padding
+        mask_pad = bincount > k
+        bincount_pad = ~mask_pad * k + mask_pad * bincount_pad
+
+        # 计算偏移量
+        _offset = F.pad(offset, (1, 0))
+        _offset_pad = F.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
+
+        # 创建padding和unpadding索引
+        pad = torch.arange(_offset_pad[-1], device=offset.device)
+        unpad = torch.arange(_offset[-1], device=offset.device)
+
+        # 处理每个batch的padding
+        for i in range(len(offset)):
+            # 调整unpad索引
+            unpad[_offset[i]:_offset[i + 1]] += _offset_pad[i] - _offset[i]
+
+            if bincount[i] < k:
+                # 如果batch点数不足k，重复填充
+                count_per_element = bincount[i]
+                this_batch_pad_count = _offset_pad[i + 1] - _offset_pad[i]
+                repeats = this_batch_pad_count // count_per_element
+                remainder = this_batch_pad_count % count_per_element
+
+                # 创建重复索引
+                base_indices = torch.arange(count_per_element, device=offset.device)
+                repeat_indices = base_indices.repeat(repeats)
+                if remainder > 0:
+                    repeat_indices = torch.cat([repeat_indices, base_indices[:remainder]])
+
+                pad[_offset_pad[i]:_offset_pad[i + 1]] = repeat_indices + _offset_pad[i]
+            else:
+                # 如果需要填充最后不完整的块
+                if bincount[i] != bincount_pad[i]:
+                    remainder_size = bincount[i] % k
+                    if remainder_size != 0:
+                        # 用前面邻近的点填充
+                        pad_start = _offset_pad[i + 1] - k + remainder_size
+                        pad_end = _offset_pad[i + 1]
+                        fill_start = _offset_pad[i + 1] - 2 * k + remainder_size
+                        fill_end = fill_start + (k - remainder_size)
+
+                        pad[pad_start:pad_end] = pad[fill_start:fill_end]
+
+            # 调整pad索引以正确映射到原始数组
+            pad[_offset_pad[i]:_offset_pad[i + 1]] -= _offset_pad[i] - _offset[i]
+
+        return pad, unpad, order, inverse
+
+    def create_serialized_neighborhoods(self, point, order_index):
+        """
+        基于序列化顺序创建邻域，全矩阵运算
+        """
+        # 获取padding信息
+        pad, unpad, order, inverse = self.get_serialized_padding_and_inverse(
+            point, self.k, order_index
+        )
+
+        # 按序列化顺序和padding重排点云
+        ordered_coords = point.coord[order][pad]  # [N_padded, 3]
+        N_original = point.coord.shape[0]
+        N_padded = ordered_coords.shape[0]
+
+        # 重塑为邻域 [num_neighborhoods, k, 3]
+        num_neighborhoods = N_padded // self.k
+        neighborhoods = ordered_coords.view(num_neighborhoods, self.k, self.coord_dim)
+
+        return neighborhoods, unpad, inverse, N_original
+
+    def compute_neighborhood_geometry(self, neighborhoods):
+        """
+        高效计算邻域内几何特征，完全矩阵化
+        """
+        num_neighborhoods, k, coord_dim = neighborhoods.shape
+        device = neighborhoods.device
+
+        # 计算邻域中心
+        centers = neighborhoods.mean(dim=1, keepdim=True)  # [num_neighborhoods, 1, 3]
+
+        # 相对坐标
+        relative_coords = neighborhoods - centers  # [num_neighborhoods, k, 3]
+
+        # 计算协方差矩阵进行PCA (批量操作)
+        # relative_coords: [num_neighborhoods, k, 3]
+        # 转置用于矩阵乘法: [num_neighborhoods, 3, k] @ [num_neighborhoods, k, 3]
+        cov_matrices = torch.bmm(
+            relative_coords.transpose(1, 2), relative_coords
+        ) / (k - 1)  # [num_neighborhoods, 3, 3]
+
+        # 批量特征值分解获取法向量
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrices)
+            # 法向量是最小特征值对应的特征向量
+            normals = eigenvectors[:, :, 0]  # [num_neighborhoods, 3]
+
+            # 扩展到每个点 [num_neighborhoods, k, 3]
+            normals_expanded = normals.unsqueeze(1).expand(-1, k, -1)
+
+            # 计算曲率 (协方差矩阵的迹和最小特征值的比值)
+            traces = torch.diagonal(cov_matrices, dim1=1, dim2=2).sum(dim=1)  # [num_neighborhoods]
+            min_eigenvals = eigenvalues[:, 0]  # [num_neighborhoods]
+            curvatures = min_eigenvals / (traces + 1e-8)  # [num_neighborhoods]
+
+            # 计算高斯曲率 (最小特征值 * 第二小特征值)
+            gaussian_curvatures = eigenvalues[:, 0] * eigenvalues[:, 1]  # [num_neighborhoods]
+
+            # 扩展曲率到每个点
+            curvatures_expanded = torch.stack([
+                curvatures.unsqueeze(1).expand(-1, k),
+                gaussian_curvatures.unsqueeze(1).expand(-1, k)
+            ], dim=-1)  # [num_neighborhoods, k, 2]
+
+        except torch.linalg.LinAlgError:
+            # 如果分解失败，使用默认值
+            normals_expanded = torch.zeros(num_neighborhoods, k, 3, device=device)
+            normals_expanded[:, :, 2] = 1.0
+            curvatures_expanded = torch.zeros(num_neighborhoods, k, 2, device=device)
+
+        return normals_expanded, curvatures_expanded
+
+    def apply_neighborhood_attention(self, coord_feat, geom_feat):
+        """
+        在邻域内应用注意力机制
+        """
+        # 结合坐标和几何特征
+        combined_feat = coord_feat + geom_feat  # [num_neighborhoods, k, hidden_dim]
+
+        # Layer norm
+        combined_feat = self.norm(combined_feat)
+
+        # 自注意力
+        enhanced_feat, attn_weights = self.neighborhood_attn(
+            combined_feat, combined_feat, combined_feat
+        )
+
+        # 残差连接
+        enhanced_feat = enhanced_feat + combined_feat
+        enhanced_feat = self.dropout(enhanced_feat)
+
+        return enhanced_feat, attn_weights
+
+    def forward(self, point, order_index=0):
+        """
+        前向传播
+        Args:
+            point: Point对象
+            order_index: 使用的序列化顺序索引
+        Returns:
+            enhanced_coords: [N, 3] 增强的坐标
+            enhanced_geom: [N, 5] 增强的几何特征
+        """
+        # 1. 创建序列化邻域
+        neighborhoods, unpad, inverse, N_original = self.create_serialized_neighborhoods(
+            point, order_index
+        )
+
+        num_neighborhoods, k, coord_dim = neighborhoods.shape
+
+        # 2. 计算几何特征
+        normals, curvatures = self.compute_neighborhood_geometry(neighborhoods)
+
+        # 3. 特征编码
+        coord_feat = self.coord_proj(neighborhoods)  # [num_neighborhoods, k, hidden_dim]
+
+        geom_input = torch.cat([normals, curvatures], dim=-1)  # [num_neighborhoods, k, 5]
+        geom_feat = self.geom_proj(geom_input)  # [num_neighborhoods, k, hidden_dim]
+
+        # 4. 邻域内注意力
+        enhanced_feat, attn_weights = self.apply_neighborhood_attention(coord_feat, geom_feat)
+
+        # 5. 输出投影
+        output = self.output_proj(enhanced_feat)  # [num_neighborhoods, k, coord_dim+5]
+
+        # 6. 展平并恢复到原始长度
+        flat_output = output.view(-1, coord_dim + 5)  # [num_neighborhoods*k, coord_dim+5]
+
+        # 通过unpad恢复到原始序列长度
+        unpadded_output = flat_output[unpad]  # [N_original, coord_dim+5]
+
+        # 7. 恢复到原始顺序
+        restored_output = torch.zeros_like(unpadded_output)
+        restored_output[inverse] = unpadded_output
+
+        # 8. 分离坐标和几何特征
+        enhanced_coords = restored_output[:, :coord_dim]
+        enhanced_geom = restored_output[:, coord_dim:]
+
+        return enhanced_coords, enhanced_geom, attn_weights.mean(dim=0)  # 返回平均注意力权重
+
+
+class FastGeometricFeatureComputer(nn.Module):
+    """
+    快速几何特征计算器，优化的版本
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def compute_surface_variation(self, neighborhoods):
+        """
+        计算表面变化特征
+        """
+        # 计算邻域内点的分散程度
+        centers = neighborhoods.mean(dim=1, keepdim=True)
+        variations = ((neighborhoods - centers) ** 2).sum(dim=-1).mean(dim=1)
+        return variations
+
+
+class Embedding(nn.Module):
+    """
+    优化的嵌入层，集成序列化邻域几何增强
+    """
+
+    def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
-        # GPU优化的动态图谱注意力模块
-        self.dynamic_atlas_attn = OptimizedDynamicAtlasAttention(
+        # 序列化邻域几何增强
+        self.geom_enhancer = SerializedNeighborhoodGeometricEnhancement(
             coord_dim=3,
             hidden_dim=64,
-            num_heads=8,
-            k_min=8,
-            k_max=32
+            k=k,
+            num_heads=4
         )
 
         # 稀疏卷积主干
-        self.stem = PointSequential(
-            conv=spconv.SubMConv3d(
-                in_channels + 5,  # 原始特征 + 几何特征(5)
-                embed_channels,
-                kernel_size=5,
-                padding=1,
-                bias=False,
-                indice_key="stem",
-            )
-        )
+        self.stem = nn.Sequential()
+
+        # 动态确定输入通道数
+        enhanced_channels = in_channels + 5  # 原始特征 + 几何特征(5)
+
+        # 添加稀疏卷积（这里需要根据你的具体需求调整）
+        # self.stem.add_module("conv", spconv.SubMConv3d(...))
+
+        # 特征融合层
+        self.feature_fusion = nn.Linear(enhanced_channels, embed_channels)
 
         if norm_layer is not None:
-            self.stem.add(norm_layer(embed_channels), name="norm")
+            self.norm = norm_layer(embed_channels)
+        else:
+            self.norm = nn.Identity()
+
         if act_layer is not None:
-            self.stem.add(act_layer(), name="act")
+            self.act = act_layer()
+        else:
+            self.act = nn.Identity()
 
-        # 特征维度调整
-        self.feature_adapter = nn.Linear(5, embed_channels) if embed_channels != 5 else nn.Identity()
-
-    def forward(self, point):
+    def forward(self, point, order_index=0):
         """
         Args:
             point: Point对象
-        Returns:
-            point: 增强后的Point对象
+            order_index: 序列化顺序索引
         """
-        coords = point.coord  # [N, 3]
-        batch = point.batch   # [N]
-
-        # 完全在GPU上计算增强特征
-        enhanced_features, fusion_weights, k_per_point = self.dynamic_atlas_attn(coords, batch)
-
-        # 提取几何特征
-        geom_feat = enhanced_features[:, 3:]  # [N, 5] - 法向量+曲率
-
-        # 处理原始特征
-        if hasattr(point, 'feat') and point.feat is not None:
-            # 如果存在原始特征，则拼接
-            combined_feat = torch.cat([point.feat, geom_feat], dim=-1)
-        else:
-            # 否则使用几何特征
-            combined_feat = geom_feat
-
-        # 更新Point对象
-        point.feat = combined_feat
-
-        # 存储额外信息
-        point.fusion_weights = fusion_weights
-        point.adaptive_k = k_per_point
-        point.enhanced_coord = enhanced_features[:, :3]
-        point.normals = enhanced_features[:, 3:6]
-        point.curvatures = enhanced_features[:, 6:8]
-        input.sparse_conv_feat = input.sparse_conv_feat.replace_feature(
-            input.feat
+        # 1. 几何增强
+        enhanced_coords, enhanced_geom, attn_weights = self.geom_enhancer(
+            point, order_index
         )
-        # 应用稀疏卷积
-        point = self.stem(point)
+
+        # 2. 特征组合
+        if hasattr(point, 'feat') and point.feat is not None:
+            combined_feat = torch.cat([point.feat, enhanced_geom], dim=-1)
+        else:
+            # 如果没有原始特征，使用坐标作为基础特征
+            combined_feat = torch.cat([point.coord, enhanced_geom], dim=-1)
+
+        # 3. 特征融合
+        fused_feat = self.feature_fusion(combined_feat)
+        fused_feat = self.norm(fused_feat)
+        fused_feat = self.act(fused_feat)
+
+        # 4. 更新point对象
+        point.feat = fused_feat
+        point.enhanced_coords = enhanced_coords
+        point.enhanced_geom = enhanced_geom
+        point.geom_attention_weights = attn_weights
+        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(
+            point.feat
+        )
+
+    # 5. 应用稀疏卷积（如果需要）
+    # point = self.stem(point)
 
         return point
-
 
 
 @MODELS.register_module("PT-v3m1")
 class PointTransformerV3(PointModule):
     def __init__(
-        self,
-        in_channels=6,
-        order=("z", "z-trans"),
-        stride=(2, 2, 2, 2),
-        enc_depths=(2, 2, 2, 6, 2),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(48, 48, 48, 48, 48),
-        dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(48, 48, 48, 48),
-        mlp_ratio=4,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        drop_path=0.3,
-        pre_norm=True,
-        shuffle_orders=True,
-        enable_rpe=False,
-        enable_flash=True,
-        upcast_attention=False,
-        upcast_softmax=False,
-        cls_mode=False,
-        pdnorm_bn=False,
-        pdnorm_ln=False,
-        pdnorm_decouple=True,
-        pdnorm_adaptive=False,
-        pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            self,
+            in_channels=6,
+            order=("z", "z-trans"),
+            stride=(2, 2, 2, 2),
+            enc_depths=(2, 2, 2, 6, 2),
+            enc_channels=(32, 64, 128, 256, 512),
+            enc_num_head=(2, 4, 8, 16, 32),
+            enc_patch_size=(48, 48, 48, 48, 48),
+            dec_depths=(2, 2, 2, 2),
+            dec_channels=(64, 64, 128, 256),
+            dec_num_head=(4, 4, 8, 16),
+            dec_patch_size=(48, 48, 48, 48),
+            mlp_ratio=4,
+            qkv_bias=True,
+            qk_scale=None,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            drop_path=0.3,
+            pre_norm=True,
+            shuffle_orders=True,
+            enable_rpe=False,
+            enable_flash=True,
+            upcast_attention=False,
+            upcast_softmax=False,
+            cls_mode=False,
+            pdnorm_bn=False,
+            pdnorm_ln=False,
+            pdnorm_decouple=True,
+            pdnorm_adaptive=False,
+            pdnorm_affine=True,
+            pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1238,8 +1497,6 @@ class PointTransformerV3(PointModule):
         assert self.cls_mode or self.num_stages == len(dec_channels) + 1
         assert self.cls_mode or self.num_stages == len(dec_num_head) + 1
         assert self.cls_mode or self.num_stages == len(dec_patch_size) + 1
-
-
 
         # norm layers
         if pdnorm_bn:
@@ -1283,7 +1540,7 @@ class PointTransformerV3(PointModule):
         SerializedAttention.static_init(enc_channels, dec_channels)
         for s in range(self.num_stages):
             enc_drop_path_ = enc_drop_path[
-                sum(enc_depths[:s]) : sum(enc_depths[: s + 1])
+                sum(enc_depths[:s]): sum(enc_depths[: s + 1])
             ]
             enc = PointSequential()
             if s > 0:
@@ -1297,7 +1554,6 @@ class PointTransformerV3(PointModule):
                     ),
                     name="down",
                 )
-
 
             for i in range(enc_depths[s]):
                 enc.add(
@@ -1337,7 +1593,7 @@ class PointTransformerV3(PointModule):
             dec_channels = list(dec_channels) + [enc_channels[-1]]
             for s in reversed(range(self.num_stages - 1)):
                 dec_drop_path_ = dec_drop_path[
-                    sum(dec_depths[:s]) : sum(dec_depths[: s + 1])
+                    sum(dec_depths[:s]): sum(dec_depths[: s + 1])
                 ]
                 dec_drop_path_.reverse()
                 dec = PointSequential()

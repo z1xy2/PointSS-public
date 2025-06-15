@@ -5,7 +5,7 @@ batch_size = 1  # bs: total bs in all gpus
 num_worker = 4
 mix_prob = 0.8
 empty_cache = False
-enable_amp = True
+enable_amp = False
 
 # model settings
 model = dict(
