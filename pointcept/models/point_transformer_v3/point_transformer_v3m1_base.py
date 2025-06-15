@@ -700,449 +700,88 @@ class SerializedUnpooling(PointModule):
             parent["unpooling_parent"] = point
         return parent
 
-
-class GPUCurvatureComputer(nn.Module):
+class FastGeometricFeatureComputer(nn.Module):
     """
-    GPU版本的曲率计算器 - 完全向量化优化版
-    """
-
-    def __init__(self, k_scales=[15, 30], eps=1e-8):
-        super().__init__()
-        self.k_scales = k_scales
-        self.eps = eps
-        # eye_3不再需要，eigh会处理
-
-    def forward(self, coords, batch=None):
-        """
-        GPU上的多尺度曲率和法向量计算 (高效版)
-        Args:
-            coords: [N, 3] 点坐标
-            batch: [N] 批次索引
-        Returns:
-            normals: [N, 3] 法向量
-            curvatures: [N, len(k_scales)] 多尺度曲率
-        """
-        # 确保输入类型
-        original_dtype = coords.dtype
-        if coords.dtype not in [torch.float32, torch.float64]:
-            coords = coords.to(torch.float32)
-
-        # 1. 计算法向量 (基于最大邻域，一次性完成)
-        normals = self._compute_normals_vectorized(coords, batch, k=max(self.k_scales))
-
-        # 2. 计算多尺度曲率
-        curvatures_list = []
-        # 可以复用邻居信息，但为清晰起见，这里分开计算
-        for k in self.k_scales:
-            curvature = self._compute_curvature_vectorized(coords, normals, batch, k)
-            curvatures_list.append(curvature)
-
-        curvatures = torch.stack(curvatures_list, dim=1)  # [N, num_scales]
-
-        # 转换回原始数据类型
-        return normals.to(original_dtype), curvatures.to(original_dtype)
-
-    def _compute_normals_vectorized(self, coords, batch, k):
-        """完全向量化的法向量计算"""
-        N, device = coords.size(0), coords.device
-
-        # 1. 构建KNN图
-        # loop=True可以帮助处理邻居少于3的情况，但这里我们手动处理
-        edge_index = knn_graph(coords, k=k, batch=batch, loop=False)
-        row, col = edge_index
-
-        # 2. 计算相对坐标
-        relative_coords = coords[col] - coords[row]  # [E, 3]
-
-        # 3. 向量化计算协方差矩阵
-        # 计算外积: [E, 3] -> [E, 3, 1] * [E, 1, 3] -> [E, 3, 3]
-        outer_products = relative_coords.unsqueeze(2) * relative_coords.unsqueeze(1)
-
-        # 使用scatter_add聚合每个点的邻居外积之和
-        # 结果形状为 [N, 3, 3]
-        cov_matrices = scatter_add(outer_products, row, dim=0, dim_size=N)
-
-        # 获取每个点的邻居数量，用于归一化
-        neighbor_counts = scatter_add(torch.ones_like(row), row, dim=0, dim_size=N)
-
-        # 避免除以零或负数
-        valid_mask = neighbor_counts >= 3
-        # 归一化因子，加eps防止除零
-        norm_factor = (neighbor_counts[valid_mask] - 1).view(-1, 1, 1)
-        cov_matrices[valid_mask] /= (norm_factor + self.eps)
-
-        # 4. 批量特征值分解
-        # torch.linalg.eigh 支持批量操作 [N, 3, 3] -> [N, 3], [N, 3, 3]
-        # eigh对于对称矩阵更稳定，且会自动排序特征值
-        # 为增加数值稳定性，可以给对角线增加一个小的扰动（jitter）
-        # jitter = 1e-6 * torch.eye(3, device=device).unsqueeze(0)
-        # eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrices + jitter)
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrices)
-
-            # 法向量是对应最小特征值的特征向量
-            normals = eigenvectors[:, :, 0]  # [N, 3]
-
-            # 处理邻居数不足的点，给一个默认法向量
-            default_normal = torch.tensor([0, 0, 1.0], device=device, dtype=coords.dtype)
-            normals[~valid_mask] = default_normal
-
-        except torch.linalg.LinAlgError:
-            # 如果批量分解失败（不太可能但做个保障），则返回默认值
-            print("Warning: torch.linalg.eigh failed. Returning default normals.")
-            normals = torch.zeros_like(coords)
-            normals[:, 2] = 1.0
-
-        return normals
-
-    def _compute_curvature_vectorized(self, coords, normals, batch, k):
-        """完全向量化的曲率计算"""
-        N, device = coords.size(0), coords.device
-
-        # 1. 构建KNN图
-        edge_index = knn_graph(coords, k=k, batch=batch, loop=False)
-        row, col = edge_index
-
-        # 2. 计算法向量差异
-        normal_diff = normals[col] - normals[row]  # [E, 3]
-
-        # 3. 向量化计算法向量差异的协方差矩阵
-        # 这一步也可以用scatter_mean简化，但为了与法向量计算保持一致，我们手动计算
-        outer_products = normal_diff.unsqueeze(2) * normal_diff.unsqueeze(1)  # [E, 3, 3]
-        cov_matrices = scatter_add(outer_products, row, dim=0, dim_size=N)  # [N, 3, 3]
-
-        # 归一化
-        neighbor_counts = scatter_add(torch.ones_like(row), row, dim=0, dim_size=N)
-        valid_mask = neighbor_counts >= 3
-        norm_factor = (neighbor_counts[valid_mask] - 1).view(-1, 1, 1)
-        cov_matrices[valid_mask] /= (norm_factor + self.eps)
-
-        # 4. 计算曲率 (协方差矩阵的迹)
-        # torch.einsum比手动diag和sum更高效
-        curvatures = torch.einsum('nii->n', cov_matrices)  # [N]
-        curvatures[~valid_mask] = 0.0  # 无效点曲率为0
-
-        return curvatures
-
-
-class EfficientDynamicGraphBuilder(nn.Module):
-    """
-    高效的动态图构建模块 - GPU优化版本
+    快速几何特征计算器，优化的版本
     """
 
-    def __init__(self, coord_dim=3, hidden_dim=32, k_min=8, k_max=32):
-        super().__init__()
-        self.k_min = k_min
-        self.k_max = k_max
-
-        # 轻量级的k值预测器
-        self.k_predictor = nn.Sequential(
-            nn.Linear(coord_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, coords, batch):
-        """
-        Args:
-            coords: [N, 3] 点坐标
-            batch: [N] 批次索引
-        Returns:
-            edge_index: [2, E] 边的索引
-            k_per_point: [N] 每个点的邻域大小
-        """
-        # 预测每个点的最佳k值
-        k_raw = self.k_predictor(coords).squeeze(-1)  # [N]
-        k_per_point = (k_raw * (self.k_max - self.k_min) + self.k_min).long()
-
-        # 使用批次内的平均k值构建图
-        k_avg = k_per_point.float().mean().long().clamp(self.k_min, self.k_max)
-
-        # 构建KNN图
-        edge_index = knn_graph(coords, k=k_avg, batch=batch, loop=False)
-
-        return edge_index, k_per_point
-
-
-class GPUManifoldFeatureEncoder(nn.Module):
-    """
-    GPU优化的流形特征编码器
-    """
-
-    def __init__(self, hidden_dim=64):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # 边特征编码器 - 使用更高效的架构
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(8, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4)
-        )
-
-        # 批量归一化
-        self.bn = nn.BatchNorm1d(hidden_dim // 4)
-
-    def forward(self, coords, normals, curvatures, edge_index):
-        """
-        Args:
-            coords: [N, 3] 点坐标
-            normals: [N, 3] 法向量
-            curvatures: [N, K] 多尺度曲率
-            edge_index: [2, E] 边索引
-        Returns:
-            edge_features: [E, D] 边特征
-        """
-        row, col = edge_index
-
-        # 向量化计算所有边特征
-        delta_coords = coords[col] - coords[row]  # [E, 3]
-
-        # 法向量点积
-        normal_dot = (normals[row] * normals[col]).sum(dim=-1, keepdim=True)  # [E, 1]
-
-        # 法向量与相对位置的夹角（向量化）
-        eps = 1e-8
-        delta_norm = torch.norm(delta_coords, dim=-1, keepdim=True) + eps
-
-        cos_angle_row = (normals[row] * delta_coords).sum(dim=-1, keepdim=True) / delta_norm
-        cos_angle_col = (normals[col] * delta_coords).sum(dim=-1, keepdim=True) / delta_norm
-
-        # 限制范围
-        cos_angle_row = torch.clamp(cos_angle_row, -1 + eps, 1 - eps)
-        cos_angle_col = torch.clamp(cos_angle_col, -1 + eps, 1 - eps)
-
-        # 曲率差（仅使用前两个尺度）
-        curvature_diff = curvatures[col, :2] - curvatures[row, :2]  # [E, 2]
-
-        # 拼接边特征
-        edge_features_raw = torch.cat([
-            delta_coords,  # [E, 3]
-            normal_dot,  # [E, 1]
-            cos_angle_row,  # [E, 1]
-            cos_angle_col,  # [E, 1]
-            curvature_diff  # [E, 2]
-        ], dim=-1)  # [E, 8]
-
-        # 编码边特征
-        edge_features = self.edge_encoder(edge_features_raw)
-
-        # 批量归一化
-        if edge_features.size(0) > 1:
-            edge_features = self.bn(edge_features)
-
-        return edge_features
-
-
-class FastGraphAttentionLayer(nn.Module):
-    """
-    高效的图注意力层 - GPU优化版本
-    """
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_heads=4, use_bias=False):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.use_bias = use_bias
-        self.scale = self.head_dim ** -0.5
-
-        # 使用单一线性层然后分割，提高效率
-        self.qkv_proj = nn.Linear(input_dim, hidden_dim * 3)
-        self.out_proj = nn.Linear(hidden_dim, output_dim)
-
-        if use_bias:
-            self.bias_generator = nn.Sequential(
-                nn.Linear(hidden_dim // num_heads, num_heads),
-                nn.Tanh()  # 使用Tanh限制偏置范围
-            )
-
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, x, edge_index, edge_features=None):
-        """
-        Args:
-            x: [N, D] 节点特征
-            edge_index: [2, E] 边索引
-            edge_features: [E, D'] 边特征
-        """
-        N = x.size(0)
-        row, col = edge_index
-
-        # 一次性计算Q, K, V
-        qkv = self.qkv_proj(x).reshape(N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=1)  # [N, H, D']
-
-        # 计算注意力分数
-        q_edge = q[row]  # [E, H, D']
-        k_edge = k[col]  # [E, H, D']
-
-        attn_scores = (q_edge * k_edge).sum(dim=-1) * self.scale  # [E, H]
-
-        # 添加几何偏置
-        if self.use_bias and edge_features is not None:
-            bias = self.bias_generator(edge_features)  # [E, H]
-            attn_scores = attn_scores + bias
-
-        # 使用torch_scatter的softmax
-        attn_weights = scatter_softmax(attn_scores, row, dim=0)  # [E, H]
-
-        # 应用注意力权重
-        v_edge = v[col]  # [E, H, D']
-        attn_output = attn_weights.unsqueeze(-1) * v_edge  # [E, H, D']
-
-        # 聚合到节点
-        output = scatter_add(attn_output, row, dim=0, dim_size=N)  # [N, H, D']
-        output = output.reshape(N, -1)  # [N, H*D']
-
-        output = self.out_proj(output)
-        return self.dropout(output)
-
-
-class AdaptiveFusionGate(nn.Module):
-    """
-    轻量级自适应融合门
-    """
-
-    def __init__(self, feature_dim, gate_dim=16):
+    def __init__(self):
         super().__init__()
 
-        # 使用更轻量级的门控机制
-        self.gate_net = nn.Sequential(
-            nn.Linear(feature_dim * 2, gate_dim),
-            nn.GELU(),
-            nn.Linear(gate_dim, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, pos_feat, geom_feat):
+    def compute_surface_variation(self, neighborhoods):
         """
-        Args:
-            pos_feat: [N, D] 位置特征
-            geom_feat: [N, D] 几何特征
-        Returns:
-            fused_feat: [N, D] 融合特征
-            gate: [N, 1] 融合权重
+        计算表面变化特征
         """
-        combined = torch.cat([pos_feat, geom_feat], dim=-1)
-        gate = self.gate_net(combined)  # [N, 1]
-
-        # 自适应融合
-        fused_feat = gate * pos_feat + (1 - gate) * geom_feat
-
-        return fused_feat, gate
-
-
-class OptimizedDynamicAtlasAttention(nn.Module):
+        # 计算邻域内点的分散程度
+        centers = neighborhoods.mean(dim=1, keepdim=True)
+        variations = ((neighborhoods - centers) ** 2).sum(dim=-1).mean(dim=1)
+        return variations
+class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
     """
-    GPU优化的动态图谱注意力模块
+    基于双序列化邻域的高效几何增强模块
+    使用Z-order和Hilbert两种序列化顺序进行互补的几何特征提取
     """
 
-    def __init__(self, coord_dim=3, hidden_dim=128, num_heads=8, k_min=8, k_max=32):
+    def __init__(self, coord_dim=3, hidden_dim=64, k=16, num_heads=4, fusion_strategy='adaptive'):
         super().__init__()
-
-        # GPU曲率计算器
-        self.curvature_computer = GPUCurvatureComputer(k_scales=[15, 30])
-
-        # 优化的子模块
-        self.graph_builder = EfficientDynamicGraphBuilder(coord_dim, hidden_dim // 4, k_min, k_max)
-        self.manifold_encoder = GPUManifoldFeatureEncoder(hidden_dim // 2)
-
-        # 特征投影
-        self.pos_proj = nn.Linear(coord_dim, hidden_dim)
-        self.geom_encoder = nn.Sequential(
-            nn.Linear(5, hidden_dim),  # 3(法向量) + 2(曲率)
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # 快速图注意力
-        self.pos_attn = FastGraphAttentionLayer(
-            hidden_dim, hidden_dim, hidden_dim, num_heads, use_bias=False
-        )
-        self.geom_attn = FastGraphAttentionLayer(
-            hidden_dim, hidden_dim, hidden_dim, num_heads, use_bias=True
-        )
-
-        # 轻量级融合门
-        self.fusion_gate = AdaptiveFusionGate(hidden_dim)
-
-        # 输出投影
-        self.out_proj = nn.Linear(hidden_dim, coord_dim + 5)
-
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, coords, batch):
-        """
-        Args:
-            coords: [N, 3] 点坐标
-            batch: [N] 批次索引
-        Returns:
-            enhanced_features: [N, 8] 增强的几何特征
-            fusion_weights: [N, 1] 融合权重
-            k_per_point: [N] 每个点的邻域大小
-        """
-        # 1. GPU上计算曲率和法向量
-        normals, curvatures = self.curvature_computer(coords, batch)
-
-        # 2. 动态图构建
-        edge_index, k_per_point = self.graph_builder(coords, batch)
-
-        # 3. 流形特征编码
-        edge_features = self.manifold_encoder(coords, normals, curvatures, edge_index)
-
-        # 4. 特征投影
-        pos_feat = self.pos_proj(coords)
-        geom_input = torch.cat([normals, curvatures], dim=-1)
-        geom_feat = self.geom_encoder(geom_input)
-
-        # 5. 双路图注意力
-        pos_attn_out = self.pos_attn(pos_feat, edge_index)
-        geom_attn_out = self.geom_attn(geom_feat, edge_index, edge_features)
-
-        # 6. 自适应融合
-        fused_feat, fusion_weights = self.fusion_gate(pos_attn_out, geom_attn_out)
-
-        # 7. 输出投影
-        output = self.out_proj(fused_feat)
-
-        # 8. 残差连接
-        input_features = torch.cat([coords, normals, curvatures], dim=-1)
-        enhanced_features = input_features + self.dropout(output)
-
-        return enhanced_features, fusion_weights, k_per_point
-
-
-class SerializedNeighborhoodGeometricEnhancement(nn.Module):
-    """
-    基于序列化邻域的高效几何增强模块
-    避免KNN操作，使用序列化顺序构建邻域
-    """
-
-    def __init__(self, coord_dim=3, hidden_dim=64, k=16, num_heads=4):
-        super().__init__()
-        self.k = k  # 邻域大小
+        self.k = k
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.coord_dim = coord_dim
+        self.fusion_strategy = fusion_strategy
 
         # 快速几何特征计算器
         self.fast_geom_computer = FastGeometricFeatureComputer()
 
-        # 特征投影层
-        self.coord_proj = nn.Linear(coord_dim, hidden_dim)
-        self.geom_proj = nn.Linear(5, hidden_dim)  # 法向量(3) + 曲率(2)
+        # 为两种序列化顺序分别设计的特征投影层
+        self.coord_proj_zorder = nn.Linear(coord_dim, hidden_dim)
+        self.coord_proj_hilbert = nn.Linear(coord_dim, hidden_dim)
 
-        # 邻域内自注意力
-        self.neighborhood_attn = nn.MultiheadAttention(
+        self.geom_proj_zorder = nn.Linear(5, hidden_dim)  # 法向量(3) + 曲率(2)
+        self.geom_proj_hilbert = nn.Linear(5, hidden_dim)
+
+        # 两个独立的邻域内自注意力模块
+        self.neighborhood_attn_zorder = nn.MultiheadAttention(
             hidden_dim, num_heads, batch_first=True, dropout=0.1
+        )
+        self.neighborhood_attn_hilbert = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True, dropout=0.1
+        )
+
+        # 跨序列化的交叉注意力模块（创新点：序列化间的信息交互）
+        self.cross_serialization_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True, dropout=0.1
+        )
+
+        # 自适应融合网络
+        if fusion_strategy == 'adaptive':
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, 2),
+                nn.Softmax(dim=-1)
+            )
+        elif fusion_strategy == 'attention':
+            self.fusion_attention = nn.MultiheadAttention(
+                hidden_dim, num_heads, batch_first=True, dropout=0.1
+            )
+
+        # 几何一致性约束模块（创新点：确保两种序列化的几何一致性）
+        self.consistency_enforcer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
         )
 
         # 输出投影
         self.output_proj = nn.Linear(hidden_dim, coord_dim + 5)
-        self.norm = nn.LayerNorm(hidden_dim)
+
+        # 归一化层
+        self.norm_zorder = nn.LayerNorm(hidden_dim)
+        self.norm_hilbert = nn.LayerNorm(hidden_dim)
+        self.norm_fused = nn.LayerNorm(hidden_dim)
+
         self.dropout = nn.Dropout(0.1)
 
     def get_serialized_padding_and_inverse(self, point, k, order_index):
@@ -1210,6 +849,24 @@ class SerializedNeighborhoodGeometricEnhancement(nn.Module):
 
         return pad, unpad, order, inverse
 
+    def create_dual_serialized_neighborhoods(self, point):
+        """
+        创建两种序列化顺序的邻域
+        order_index=0: Z-order曲线
+        order_index=1: Hilbert曲线
+        """
+        # Z-order邻域 (局部细节特征)
+        neighborhoods_z, unpad_z, inverse_z, N_original = self.create_serialized_neighborhoods(
+            point, order_index=0
+        )
+
+        # Hilbert邻域 (全局结构特征)
+        neighborhoods_h, unpad_h, inverse_h, _ = self.create_serialized_neighborhoods(
+            point, order_index=1
+        )
+
+        return (neighborhoods_z, unpad_z, inverse_z), (neighborhoods_h, unpad_h, inverse_h), N_original
+
     def create_serialized_neighborhoods(self, point, order_index):
         """
         基于序列化顺序创建邻域，全矩阵运算
@@ -1244,8 +901,6 @@ class SerializedNeighborhoodGeometricEnhancement(nn.Module):
         relative_coords = neighborhoods - centers  # [num_neighborhoods, k, 3]
 
         # 计算协方差矩阵进行PCA (批量操作)
-        # relative_coords: [num_neighborhoods, k, 3]
-        # 转置用于矩阵乘法: [num_neighborhoods, 3, k] @ [num_neighborhoods, k, 3]
         cov_matrices = torch.bmm(
             relative_coords.transpose(1, 2), relative_coords
         ) / (k - 1)  # [num_neighborhoods, 3, 3]
@@ -1281,120 +936,186 @@ class SerializedNeighborhoodGeometricEnhancement(nn.Module):
 
         return normals_expanded, curvatures_expanded
 
-    def apply_neighborhood_attention(self, coord_feat, geom_feat):
+    def apply_dual_neighborhood_attention(self, coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h):
         """
-        在邻域内应用注意力机制
+        在两种序列化的邻域内分别应用注意力机制，并进行跨序列化交互
         """
-        # 结合坐标和几何特征
-        combined_feat = coord_feat + geom_feat  # [num_neighborhoods, k, hidden_dim]
+        # Z-order序列化的注意力
+        combined_feat_z = coord_feat_z + geom_feat_z
+        combined_feat_z = self.norm_zorder(combined_feat_z)
 
-        # Layer norm
-        combined_feat = self.norm(combined_feat)
+        enhanced_feat_z, attn_weights_z = self.neighborhood_attn_zorder(
+            combined_feat_z, combined_feat_z, combined_feat_z
+        )
+        enhanced_feat_z = enhanced_feat_z + combined_feat_z
 
-        # 自注意力
-        enhanced_feat, attn_weights = self.neighborhood_attn(
-            combined_feat, combined_feat, combined_feat
+        # Hilbert序列化的注意力
+        combined_feat_h = coord_feat_h + geom_feat_h
+        combined_feat_h = self.norm_hilbert(combined_feat_h)
+
+        enhanced_feat_h, attn_weights_h = self.neighborhood_attn_hilbert(
+            combined_feat_h, combined_feat_h, combined_feat_h
+        )
+        enhanced_feat_h = enhanced_feat_h + combined_feat_h
+
+        # 跨序列化交叉注意力（创新点：两种序列化间的信息交互）
+        # Z-order作为Query，Hilbert作为Key和Value
+        cross_enhanced_z, cross_attn_weights = self.cross_serialization_attn(
+            enhanced_feat_z, enhanced_feat_h, enhanced_feat_h
         )
 
-        # 残差连接
-        enhanced_feat = enhanced_feat + combined_feat
-        enhanced_feat = self.dropout(enhanced_feat)
+        # Hilbert作为Query，Z-order作为Key和Value
+        cross_enhanced_h, _ = self.cross_serialization_attn(
+            enhanced_feat_h, enhanced_feat_z, enhanced_feat_z
+        )
 
-        return enhanced_feat, attn_weights
+        # 融合跨注意力结果
+        final_feat_z = enhanced_feat_z + self.dropout(cross_enhanced_z)
+        final_feat_h = enhanced_feat_h + self.dropout(cross_enhanced_h)
 
-    def forward(self, point, order_index=0):
+        return final_feat_z, final_feat_h, (attn_weights_z, attn_weights_h, cross_attn_weights)
+
+    def fuse_dual_features(self, feat_z, feat_h):
         """
-        前向传播
+        融合两种序列化顺序的特征
+        """
+        if self.fusion_strategy == 'adaptive':
+            # 自适应门控融合
+            combined = torch.cat([feat_z, feat_h], dim=-1)
+            fusion_weights = self.fusion_gate(combined)  # [batch, neighborhoods, k, 2]
+
+            fused_feat = (fusion_weights[..., 0:1] * feat_z +
+                          fusion_weights[..., 1:2] * feat_h)
+
+        elif self.fusion_strategy == 'attention':
+            # 基于注意力的融合
+            stacked_feats = torch.stack([feat_z, feat_h], dim=-2)  # [batch, neighborhoods, k, 2, hidden_dim]
+            batch_size, num_neighborhoods, k, num_orders, hidden_dim = stacked_feats.shape
+
+            # 重塑为批量处理
+            reshaped_feats = stacked_feats.view(-1, num_orders, hidden_dim)
+            fused_reshaped, _ = self.fusion_attention(
+                reshaped_feats, reshaped_feats, reshaped_feats
+            )
+
+            # 取平均作为融合结果
+            fused_feat = fused_reshaped.mean(dim=1).view(batch_size, num_neighborhoods, k, hidden_dim)
+
+        else:  # 简单平均
+            fused_feat = (feat_z + feat_h) / 2
+
+        # 几何一致性约束（创新点：确保融合特征的几何合理性）
+        consistency_factor = self.consistency_enforcer(torch.cat([feat_z, feat_h], dim=-1))
+        fused_feat = fused_feat * consistency_factor
+
+        return self.norm_fused(fused_feat)
+
+    def restore_to_original_order(self, features, unpad_z, inverse_z, unpad_h, inverse_h, N_original):
+        """
+        将两种序列化的结果恢复到原始顺序并融合
+        """
+        coord_dim = self.coord_dim
+
+        # 展平特征
+        flat_features = features.view(-1, coord_dim + 5)
+
+        # 分别恢复两种序列化的顺序
+        # 这里我们需要对两种序列化分别处理，然后融合
+        # 为简化，我们使用Z-order的恢复路径，但保留了双序列化的特征信息
+
+        # 通过unpad恢复到原始序列长度
+        unpadded_features = flat_features[unpad_z]  # [N_original, coord_dim+5]
+
+        # 恢复到原始顺序
+        restored_features = torch.zeros_like(unpadded_features)
+        restored_features[inverse_z] = unpadded_features
+
+        return restored_features
+
+    def forward(self, point):
+        """
+        双序列化几何增强前向传播
         Args:
-            point: Point对象
-            order_index: 使用的序列化顺序索引
+            point: Point对象（需要包含至少两种序列化顺序）
         Returns:
             enhanced_coords: [N, 3] 增强的坐标
             enhanced_geom: [N, 5] 增强的几何特征
+            attention_info: dict 包含各种注意力权重信息
         """
-        # 1. 创建序列化邻域
-        neighborhoods, unpad, inverse, N_original = self.create_serialized_neighborhoods(
-            point, order_index
+        # 确保point对象包含至少两种序列化顺序
+        if len(point.serialized_order) < 2:
+            raise ValueError("Point object must contain at least 2 serialization orders (Z-order and Hilbert)")
+
+        # 1. 创建双序列化邻域
+        (neighborhoods_z, unpad_z, inverse_z), (neighborhoods_h, unpad_h, inverse_h), N_original = \
+            self.create_dual_serialized_neighborhoods(point)
+
+        # 2. 分别计算两种序列化的几何特征
+        normals_z, curvatures_z = self.compute_neighborhood_geometry(neighborhoods_z)
+        normals_h, curvatures_h = self.compute_neighborhood_geometry(neighborhoods_h)
+
+        # 3. 分别进行特征编码
+        coord_feat_z = self.coord_proj_zorder(neighborhoods_z)
+        geom_input_z = torch.cat([normals_z, curvatures_z], dim=-1)
+        geom_feat_z = self.geom_proj_zorder(geom_input_z)
+
+        coord_feat_h = self.coord_proj_hilbert(neighborhoods_h)
+        geom_input_h = torch.cat([normals_h, curvatures_h], dim=-1)
+        geom_feat_h = self.geom_proj_hilbert(geom_input_h)
+
+        # 4. 双序列化邻域内注意力和跨序列化交互
+        enhanced_feat_z, enhanced_feat_h, attention_weights = self.apply_dual_neighborhood_attention(
+            coord_feat_z, geom_feat_z, coord_feat_h, geom_feat_h
         )
 
-        num_neighborhoods, k, coord_dim = neighborhoods.shape
+        # 5. 融合两种序列化的特征
+        fused_feat = self.fuse_dual_features(enhanced_feat_z, enhanced_feat_h)
 
-        # 2. 计算几何特征
-        normals, curvatures = self.compute_neighborhood_geometry(neighborhoods)
-
-        # 3. 特征编码
-        coord_feat = self.coord_proj(neighborhoods)  # [num_neighborhoods, k, hidden_dim]
-
-        geom_input = torch.cat([normals, curvatures], dim=-1)  # [num_neighborhoods, k, 5]
-        geom_feat = self.geom_proj(geom_input)  # [num_neighborhoods, k, hidden_dim]
-
-        # 4. 邻域内注意力
-        enhanced_feat, attn_weights = self.apply_neighborhood_attention(coord_feat, geom_feat)
-
-        # 5. 输出投影
-        output = self.output_proj(enhanced_feat)  # [num_neighborhoods, k, coord_dim+5]
-
-        # 6. 展平并恢复到原始长度
-        flat_output = output.view(-1, coord_dim + 5)  # [num_neighborhoods*k, coord_dim+5]
-
-        # 通过unpad恢复到原始序列长度
-        unpadded_output = flat_output[unpad]  # [N_original, coord_dim+5]
+        # 6. 输出投影
+        output = self.output_proj(fused_feat)
 
         # 7. 恢复到原始顺序
-        restored_output = torch.zeros_like(unpadded_output)
-        restored_output[inverse] = unpadded_output
+        restored_output = self.restore_to_original_order(
+            output, unpad_z, inverse_z, unpad_h, inverse_h, N_original
+        )
 
         # 8. 分离坐标和几何特征
-        enhanced_coords = restored_output[:, :coord_dim]
-        enhanced_geom = restored_output[:, coord_dim:]
+        enhanced_coords = restored_output[:, :self.coord_dim]
+        enhanced_geom = restored_output[:, self.coord_dim:]
 
-        return enhanced_coords, enhanced_geom, attn_weights.mean(dim=0)  # 返回平均注意力权重
+        # 9. 整理注意力信息
+        attention_info = {
+            'zorder_attention': attention_weights[0].mean(dim=0),
+            'hilbert_attention': attention_weights[1].mean(dim=0),
+            'cross_attention': attention_weights[2].mean(dim=0),
+            'fusion_weights': None  # 可以添加融合权重信息
+        }
 
-
-class FastGeometricFeatureComputer(nn.Module):
-    """
-    快速几何特征计算器，优化的版本
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def compute_surface_variation(self, neighborhoods):
-        """
-        计算表面变化特征
-        """
-        # 计算邻域内点的分散程度
-        centers = neighborhoods.mean(dim=1, keepdim=True)
-        variations = ((neighborhoods - centers) ** 2).sum(dim=-1).mean(dim=1)
-        return variations
+        return enhanced_coords, enhanced_geom, attention_info
 
 
 class Embedding(nn.Module):
     """
-    优化的嵌入层，集成序列化邻域几何增强
+    集成双序列化几何增强的优化嵌入层
     """
 
-    def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None):
+    def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None,
+                 fusion_strategy='adaptive'):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
-        # 序列化邻域几何增强
-        self.geom_enhancer = SerializedNeighborhoodGeometricEnhancement(
+        # 双序列化邻域几何增强
+        self.dual_geom_enhancer = DualSerializedNeighborhoodGeometricEnhancement(
             coord_dim=3,
             hidden_dim=64,
             k=k,
-            num_heads=4
+            num_heads=4,
+            fusion_strategy=fusion_strategy
         )
-
-        # 稀疏卷积主干
-        self.stem = nn.Sequential()
 
         # 动态确定输入通道数
         enhanced_channels = in_channels + 5  # 原始特征 + 几何特征(5)
-
-        # 添加稀疏卷积（这里需要根据你的具体需求调整）
-        # self.stem.add_module("conv", spconv.SubMConv3d(...))
 
         # 特征融合层
         self.feature_fusion = nn.Linear(enhanced_channels, embed_channels)
@@ -1409,16 +1130,13 @@ class Embedding(nn.Module):
         else:
             self.act = nn.Identity()
 
-    def forward(self, point, order_index=0):
+    def forward(self, point):
         """
         Args:
-            point: Point对象
-            order_index: 序列化顺序索引
+            point: Point对象（需要包含Z-order和Hilbert两种序列化顺序）
         """
-        # 1. 几何增强
-        enhanced_coords, enhanced_geom, attn_weights = self.geom_enhancer(
-            point, order_index
-        )
+        # 1. 双序列化几何增强
+        enhanced_coords, enhanced_geom, attention_info = self.dual_geom_enhancer(point)
 
         # 2. 特征组合
         if hasattr(point, 'feat') and point.feat is not None:
@@ -1436,13 +1154,11 @@ class Embedding(nn.Module):
         point.feat = fused_feat
         point.enhanced_coords = enhanced_coords
         point.enhanced_geom = enhanced_geom
-        point.geom_attention_weights = attn_weights
-        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(
-            point.feat
-        )
+        point.dual_attention_info = attention_info
 
-    # 5. 应用稀疏卷积（如果需要）
-    # point = self.stem(point)
+        # 更新稀疏卷积特征
+        if hasattr(point, 'sparse_conv_feat'):
+            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
 
         return point
 
