@@ -35,6 +35,9 @@ from torch_scatter import scatter_mean, scatter_max, scatter_add, scatter_softma
 from pointcept.models.utils import offset2batch, batch2offset
 from pointcept.models.utils.serialization import encode, decode
 
+# 🆕 导入ASD-SSM模块
+from .integrate_asd_ssm import ASDSSMWrapper
+
 
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
@@ -121,6 +124,8 @@ class SerializedAttention(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             area_num=2,
+            use_asd_ssm=True,  # 🆕 控制是否使用ASD-SSM
+            num_scales=2,      # 🆕 ASD-SSM的尺度数量
 
     ):
         super().__init__()
@@ -136,6 +141,9 @@ class SerializedAttention(PointModule):
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash
         self.area_num = area_num
+        self.use_asd_ssm = use_asd_ssm  # 🆕 保存配置
+        self.num_scales = num_scales    # 🆕 保存尺度数量
+
         if enable_flash:
             assert (
                     enable_rpe is False
@@ -167,27 +175,38 @@ class SerializedAttention(PointModule):
         self.mlp = MLP(channels, channels)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
-        self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
-                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                 bimamba_type='v2',
-                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
-                                 residual_in_fp32=True,
-                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
-        self.mamba1 = MambaBlock(dim=channels, layer_idx=None,
-                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                 bimamba_type='v2',
-                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
-                                 residual_in_fp32=True,
-                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
-        self.mamba2 = MambaBlock(dim=channels, layer_idx=None,
-                                 # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                 # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                 bimamba_type='v2',
-                                 norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
-                                 residual_in_fp32=True,
-                                 drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+
+        # 🆕 根据配置选择使用原始Mamba或ASD-SSM
+        if use_asd_ssm:
+            # 使用ASD-SSM Wrapper
+            self.asd_ssm_wrapper = ASDSSMWrapper(
+                channels=channels,
+                num_scales=num_scales
+            )
+            print(f"🚀 Layer {layer_idx}: Using ASD-SSM with {num_scales} scales")
+        else:
+            # 使用原始Mamba
+            self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
+                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                     bimamba_type='v2',
+                                     norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                     residual_in_fp32=True,
+                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+            self.mamba1 = MambaBlock(dim=channels, layer_idx=None,
+                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                     bimamba_type='v2',
+                                     norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                     residual_in_fp32=True,
+                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+            self.mamba2 = MambaBlock(dim=channels, layer_idx=None,
+                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
+                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
+                                     bimamba_type='v2',
+                                     norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
+                                     residual_in_fp32=True,
+                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -353,7 +372,13 @@ class SerializedAttention(PointModule):
         layer_order_prompt = layer_order_prompt_proj(layer_order_prompt)
         layer_order_prompt = layer_order_prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
         x = torch.cat([layer_order_prompt, x, layer_order_prompt], dim=1)  # 很神奇，将顺序提示当做点给添加进去了，前面六个点，后面六个点，实际都是顺序提示
-        x, x_res = self.mamba0(x, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+
+        # 🆕 使用ASD-SSM或原始Mamba
+        if self.use_asd_ssm:
+            x, x_res, scale_info_0 = self.asd_ssm_wrapper(x, scale_id=0, x_res=x_res)
+        else:
+            x, x_res = self.mamba0(x, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+
         x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]  # 出来时将前后的顺序提示去掉
         x = x.reshape(-1, C)  # 返回为非patch的情况
         feat0 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
@@ -375,7 +400,14 @@ class SerializedAttention(PointModule):
             x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
         x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
 
-        x_shuffled, x_res = self.mamba1(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+        # 🆕 使用ASD-SSM或原始Mamba
+        if self.use_asd_ssm:
+            x_shuffled, x_res, scale_info_1 = self.asd_ssm_wrapper(
+                x_shuffled, scale_id=1, x_res=x_res
+            )
+        else:
+            x_shuffled, x_res = self.mamba1(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+
         x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
 
         x = x.reshape(-1, C)  # 返回为非patch的情况
