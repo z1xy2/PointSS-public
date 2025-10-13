@@ -61,16 +61,6 @@ class ScaleAwareParameterGenerator(nn.Module):
             nn.Linear(d_model, d_model * 3)  # 生成 ΔA, ΔB, ΔC
         )
 
-        # 尺度特定的时间步长生成
-        # 粗尺度需要大时间步（粗粒度时间分辨率）
-        # 细尺度需要小时间步（细粒度时间分辨率）
-        self.delta_generator = nn.Sequential(
-            nn.Linear(input_dim, d_model // 4),
-            nn.GELU(),
-            nn.Linear(d_model // 4, 1),
-            nn.Softplus()  # 确保 Δt > 0
-        )
-
         # 尺度约束因子：控制不同尺度的状态衰减速度
         # 粗尺度（idx=0）: 0.9 → 状态衰减慢，保留长程信息
         # 细尺度（idx=num_scales-1）: 0.3 → 状态衰减快，快速响应局部变化
@@ -94,7 +84,6 @@ class ScaleAwareParameterGenerator(nn.Module):
             delta_A: (N, C) A矩阵的偏移量
             delta_B: (N, C) B矩阵的偏移量
             delta_C: (N, C) C矩阵的偏移量
-            delta_t: (N, 1) 时间步长调整因子
             scale_info: dict 包含尺度相关信息（用于可视化和分析）
         """
         N, L, C = features.shape
@@ -132,23 +121,16 @@ class ScaleAwareParameterGenerator(nn.Module):
         delta_B = self.param_norm(delta_B)
         delta_C = self.param_norm(delta_C)
 
-        # 7. 生成动态时间步长
-        delta_t = self.delta_generator(condition)  # (N, 1)
-        # 粗尺度倾向于大时间步，细尺度倾向于小时间步
-        scale_time_factor = 1.0 + (scale_id / (self.num_scales - 1)) * 0.5
-        delta_t = delta_t * scale_time_factor
-
-        # 8. 收集尺度信息（用于分析和可视化）
+        # 7. 收集尺度信息（用于分析和可视化）
         scale_info = {
             'scale_id': scale_id,
             'scale_constraint': scale_constraint.item(),
             'delta_A_mean': delta_A.mean().item(),
             'delta_A_std': delta_A.std().item(),
-            'delta_t_mean': delta_t.mean().item(),
             'global_feat_norm': global_feat.norm(dim=-1).mean().item() if self.use_global_feature else 0.0
         }
 
-        return delta_A, delta_B, delta_C, delta_t, scale_info
+        return delta_A, delta_B, delta_C, scale_info
 
 
 class AdaptiveScaleDecoupledMamba(nn.Module):
@@ -158,7 +140,7 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
     核心创新：为不同尺度生成定制化的SSM参数
     - 共享基础Mamba结构（参数效率）
     - 通过参数生成器为每个尺度定制SSM行为（表达能力）
-    - 动态调整状态转移矩阵和时间步长（自适应性）
+    - 动态调整状态转移矩阵（自适应性）
 
     Args:
         d_model: 特征维度
@@ -207,7 +189,7 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
             scale_info: 尺度信息字典
         """
         # 1. 生成尺度特定的参数偏移
-        delta_A, delta_B, delta_C, delta_t, scale_info = self.param_generator(
+        delta_A, delta_B, delta_C, scale_info = self.param_generator(
             x, scale_id
         )
 
@@ -230,7 +212,7 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
         if x_res is not None:
             output = output + self.residual_weight * x_res
 
-        # 6. 添加时间步长信息到scale_info
+        # 6. 添加输出统计到scale_info
         scale_info['output_norm'] = output.norm(dim=-1).mean().item()
 
         return output, x_res, scale_info
