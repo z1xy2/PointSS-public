@@ -189,44 +189,8 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
             d_model, num_scales, use_global_feature
         )
 
-        # 参数调制网络：将生成的偏移量融合到基础参数
-        # 使用门控机制控制偏移量的影响程度
-        self.param_modulation = nn.ModuleDict({
-            'A_gate': nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.Sigmoid()
-            ),
-            'B_gate': nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.Sigmoid()
-            ),
-            'C_gate': nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.Sigmoid()
-            ),
-        })
-
         # 残差连接的权重
         self.residual_weight = nn.Parameter(torch.ones(1))
-
-    def apply_parameter_modulation(self, delta_A, delta_B, delta_C):
-        """
-        应用门控机制调制参数偏移量
-
-        门控机制的作用：
-        - 控制偏移量的影响程度
-        - 防止参数偏移过大导致训练不稳定
-        - 允许模型学习何时应用尺度特定调整
-        """
-        gate_A = self.param_modulation['A_gate'](delta_A)
-        gate_B = self.param_modulation['B_gate'](delta_B)
-        gate_C = self.param_modulation['C_gate'](delta_C)
-
-        modulated_A = delta_A * gate_A
-        modulated_B = delta_B * gate_B
-        modulated_C = delta_C * gate_C
-
-        return modulated_A, modulated_B, modulated_C
 
     def forward(self, x, scale_id, x_res=None):
         """
@@ -247,30 +211,26 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
             x, scale_id
         )
 
-        # 2. 应用门控调制
-        delta_A, delta_B, delta_C = self.apply_parameter_modulation(
-            delta_A, delta_B, delta_C
-        )
-
-        # 3. 将参数偏移应用到输入特征
+        # 2. 将参数偏移应用到输入特征
         # 这里采用特征调制而非直接修改Mamba内部参数（更易实现）
         # 理论上等价于修改SSM参数矩阵
+        # 前面已有LayerNorm和scale_constraint确保参数在合理范围内
         x_modulated = x + delta_B.unsqueeze(1)  # B参数影响输入
 
-        # 4. 通过基础Mamba处理
+        # 3. 通过基础Mamba处理
         output, x_res = self.base_mamba(x_modulated, x_res)
 
-        # 5. 应用A和C参数的调制
+        # 4. 应用A和C参数的调制
         # A参数影响状态演化（通过调制输出实现）
         # C参数影响输出投影
         output = output * (1.0 + delta_A.unsqueeze(1) * 0.1)  # 0.1是缩放因子，防止变化过大
         output = output + delta_C.unsqueeze(1) * 0.1
 
-        # 6. 残差连接
+        # 5. 残差连接
         if x_res is not None:
             output = output + self.residual_weight * x_res
 
-        # 7. 添加时间步长信息到scale_info
+        # 6. 添加时间步长信息到scale_info
         scale_info['output_norm'] = output.norm(dim=-1).mean().item()
 
         return output, x_res, scale_info
