@@ -63,6 +63,11 @@ class ASDSSMWrapper(nn.Module):
     """
     包装器：将ASD-SSM集成到现有的SerializedAttention中
 
+    🆕 支持Patch间状态传递：
+    - 所有尺度均启用状态传递，直接将前一Patch的最终状态作为当前Patch的初始状态
+    - 符合标准SSM公式：h_0^(s,m) = h_P^(s,m-1)
+    - Patch内部点云打乱，在利用序列化顺序的同时尊重点云的无序性
+
     使用方法：
     在point_transformer_v3m1_base.py的SerializedAttention.__init__中添加：
     ```python
@@ -80,18 +85,29 @@ class ASDSSMWrapper(nn.Module):
     ```
     """
 
-    def __init__(self, channels, num_scales=3):
+    def __init__(self, channels, num_scales=3, enable_state_passing_scales=None):
+        """
+        Args:
+            channels: 特征通道数
+            num_scales: 尺度数量
+            enable_state_passing_scales: 哪些尺度启用状态传递（默认所有尺度启用）
+        """
         super().__init__()
         self.channels = channels
         self.num_scales = num_scales
+        # 🆕 默认所有尺度都启用状态传递
+        if enable_state_passing_scales is None:
+            enable_state_passing_scales = list(range(num_scales))
+        self.enable_state_passing_scales = enable_state_passing_scales
 
-        # 创建多个ASD-Mamba，对应不同的尺度
+        # 创建多个ASD-Mamba，对应不同的尺度，所有尺度都启用状态传递
         self.asd_mambas = nn.ModuleList([
             AdaptiveScaleDecoupledMamba(
                 d_model=channels,
                 num_scales=num_scales,
                 layer_idx=i,
-                use_global_feature=True
+                use_global_feature=True,
+                enable_state_passing=(i in enable_state_passing_scales)  # 默认全部启用
             )
             for i in range(num_scales)
         ])
@@ -101,10 +117,10 @@ class ASDSSMWrapper(nn.Module):
 
     def forward(self, x, scale_id=0, x_res=None):
         """
-        使用ASD-SSM处理输入
+        使用ASD-SSM处理输入，支持patch间状态传递
 
         Args:
-            x: (N, L, C) 输入特征
+            x: (N_patches, L, C) 输入特征，N_patches是patch数量
             scale_id: 当前尺度ID
             x_res: 残差
 
@@ -117,8 +133,31 @@ class ASDSSMWrapper(nn.Module):
         scale_id = min(scale_id, self.num_scales - 1)
         asd_mamba = self.asd_mambas[scale_id]
 
-        # 前向传播
-        x, x_res, scale_info = asd_mamba(x, scale_id, x_res)
+        N_patches, L, C = x.shape
+
+        # 🆕 对于启用状态传递的尺度，逐个patch处理并传递状态
+        if scale_id in self.enable_state_passing_scales and N_patches > 1:
+            outputs = []
+            h_state = None  # 初始隐状态为None
+
+            for i in range(N_patches):
+                # 处理当前patch
+                x_patch = x[i:i+1]  # (1, L, C)
+
+                # 前向传播，传入前一个patch的隐状态
+                out_patch, x_res, h_state, scale_info = asd_mamba(
+                    x_patch, scale_id, x_res, h_init=h_state
+                )
+                outputs.append(out_patch)
+
+                # h_state会自动传递到下一个patch
+
+            # 合并所有patch的输出
+            x = torch.cat(outputs, dim=0)  # (N_patches, L, C)
+
+        else:
+            # 不启用状态传递的尺度，或者只有一个patch，直接处理
+            x, x_res, h_final, scale_info = asd_mamba(x, scale_id, x_res, h_init=None)
 
         # 收集信息（用于可视化和分析）
         if self.training:

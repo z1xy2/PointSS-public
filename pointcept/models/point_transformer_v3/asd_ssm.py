@@ -149,11 +149,12 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
         use_global_feature: 是否使用全局特征
     """
 
-    def __init__(self, d_model, num_scales=3, layer_idx=None, use_global_feature=True):
+    def __init__(self, d_model, num_scales=3, layer_idx=None, use_global_feature=True, enable_state_passing=True):
         super().__init__()
         self.d_model = d_model
         self.num_scales = num_scales
         self.layer_idx = layer_idx
+        self.enable_state_passing = enable_state_passing  # 🆕 是否启用状态传递
 
         # 基础Mamba模块（共享参数）
         self.base_mamba = MambaBlock(
@@ -174,7 +175,11 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
         # 残差连接的权重
         self.residual_weight = nn.Parameter(torch.ones(1))
 
-    def forward(self, x, scale_id, x_res=None):
+        # 🆕 状态传递相关：直接传递策略（无门控）
+        # 与论文描述一致：h_0^(s,m) = h_P^(s,m-1)
+        # 不需要额外的投影或门控机制，直接使用SSM的状态更新公式
+
+    def forward(self, x, scale_id, x_res=None, h_init=None):
         """
         使用尺度特定的参数处理输入
 
@@ -182,10 +187,12 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
             x: (N, L, C) 输入特征序列
             scale_id: 当前尺度编号
             x_res: 残差连接（可选）
+            h_init: (N, C) 初始隐状态（用于patch间状态传递，可选）
 
         Returns:
             output: (N, L, C) 输出特征
             x_res: 更新后的残差
+            h_final: (N, C) 最终隐状态（用于传递给下一个patch）
             scale_info: 尺度信息字典
         """
         # 1. 生成尺度特定的参数偏移
@@ -199,23 +206,39 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
         # 前面已有LayerNorm和scale_constraint确保参数在合理范围内
         x_modulated = x + delta_B.unsqueeze(1)  # B参数影响输入
 
-        # 3. 通过基础Mamba处理
+        # 🆕 3. 直接传递状态（无门控）
+        # 论文公式：h_0^(s,m) = h_P^(s,m-1)
+        # 将前一个patch的最终状态直接作为当前patch的初始状态
+        if self.enable_state_passing and h_init is not None:
+            # 直接将前一个patch的隐状态添加到第一个时间步
+            # 这等价于SSM状态更新：h_1 = A*h_0 + B*u_1，其中h_0 = h_init
+            x_modulated[:, 0, :] = x_modulated[:, 0, :] + h_init
+
+            scale_info['state_passing_enabled'] = True
+        else:
+            scale_info['state_passing_enabled'] = False
+
+        # 4. 通过基础Mamba处理
         output, x_res = self.base_mamba(x_modulated, x_res)
 
-        # 4. 应用A和C参数的调制
+        # 5. 应用A和C参数的调制
         # A参数影响状态演化（通过调制输出实现）
         # C参数影响输出投影
         output = output * (1.0 + delta_A.unsqueeze(1) * 0.1)  # 0.1是缩放因子，防止变化过大
         output = output + delta_C.unsqueeze(1) * 0.1
 
-        # 5. 残差连接
+        # 6. 残差连接
         if x_res is not None:
             output = output + self.residual_weight * x_res
 
-        # 6. 添加输出统计到scale_info
-        scale_info['output_norm'] = output.norm(dim=-1).mean().item()
+        # 🆕 7. 提取最终隐状态（最后一个时间步的输出作为隐状态）
+        h_final = output[:, -1, :].clone()  # (N, C)
 
-        return output, x_res, scale_info
+        # 8. 添加输出统计到scale_info
+        scale_info['output_norm'] = output.norm(dim=-1).mean().item()
+        scale_info['h_final_norm'] = h_final.norm(dim=-1).mean().item()
+
+        return output, x_res, h_final, scale_info
 
 
 class ScaleSequentialMambaWithASDSSM(nn.Module):
