@@ -39,6 +39,318 @@ from pointcept.models.utils.serialization import encode, decode
 from .integrate_asd_ssm import ASDSSMWrapper
 
 
+# ============ MASA: Multi-path Adaptive Serialization Network ============
+
+class GeometricImportanceEncoder(nn.Module):
+    """
+    几何感知的重要性场预测器
+    提取多尺度几何特征用于路由决策
+    """
+    def __init__(self, feat_dim=32, hidden_dim=128, num_scales=3, k_neighbors=16):
+        super().__init__()
+        self.num_scales = num_scales
+        self.k_neighbors = k_neighbors
+        self.feat_dim = feat_dim
+
+        # 几何描述符维度：linearity(1) + planarity(1) + scattering(1) + normal_var(1) + density(1) = 5
+        self.geom_dim = 5
+
+        # 多尺度编码器（每个尺度一个MLP）
+        self.scale_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(feat_dim + self.geom_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim // 2)
+            ) for _ in range(num_scales)
+        ])
+
+        # 聚合网络
+        self.aggregator = nn.Sequential(
+            nn.Linear(hidden_dim // 2 * num_scales, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()  # 输出重要性分数 [0,1]
+        )
+
+    def compute_local_geometry(self, coord, feat, k=16):
+        """
+        计算局部几何描述符
+        Args:
+            coord: [N, 3] 点坐标
+            feat: [N, C] 点特征
+            k: k近邻数量
+        Returns:
+            geom_desc: [N, 5] 几何描述符 (linearity, planarity, scattering, normal_var, density)
+        """
+        device = coord.device
+        N = coord.shape[0]
+
+        # 构建k近邻图
+        try:
+            edge_index = knn_graph(coord, k=k, batch=None, loop=False)
+        except:
+            # 如果点数不足k，返回零特征
+            return torch.zeros(N, self.geom_dim, device=device)
+
+        row, col = edge_index
+
+        # 计算每个点的邻域坐标
+        neighborhoods = coord[col].view(N, k, 3)  # [N, k, 3]
+
+        # 1. PCA计算曲率特征
+        centers = neighborhoods.mean(dim=1, keepdim=True)  # [N, 1, 3]
+        centered = neighborhoods - centers  # [N, k, 3]
+
+        # 协方差矩阵
+        cov = torch.bmm(centered.transpose(1, 2), centered) / (k - 1)  # [N, 3, 3]
+
+        # 特征值分解
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)  # eigenvalues: [N, 3]
+            eigenvalues = eigenvalues.abs() + 1e-8  # 避免负值和除零
+
+            # 按降序排列
+            eigenvalues, _ = torch.sort(eigenvalues, dim=1, descending=True)
+            lambda1, lambda2, lambda3 = eigenvalues[:, 0], eigenvalues[:, 1], eigenvalues[:, 2]
+
+            # 几何特征
+            linearity = (lambda1 - lambda2) / lambda1  # [N]
+            planarity = (lambda2 - lambda3) / lambda1
+            scattering = lambda3 / lambda1
+        except:
+            linearity = torch.zeros(N, device=device)
+            planarity = torch.zeros(N, device=device)
+            scattering = torch.zeros(N, device=device)
+
+        # 2. 法向量变化（使用最小特征值对应的特征向量作为法向量）
+        try:
+            normals = eigenvectors[:, :, 0]  # [N, 3]
+            # 邻域内法向量的方差
+            neighbor_normals = normals[col].view(N, k, 3)
+            normal_var = neighbor_normals.var(dim=1).mean(dim=1)  # [N]
+        except:
+            normal_var = torch.zeros(N, device=device)
+
+        # 3. 点云密度
+        distances = torch.norm(centered, dim=2)  # [N, k]
+        avg_dist = distances.mean(dim=1) + 1e-8  # [N]
+        density = 1.0 / avg_dist  # 密度 = 1/平均距离
+
+        # 归一化到[0,1]
+        density = (density - density.min()) / (density.max() - density.min() + 1e-8)
+
+        # 组合几何描述符
+        geom_desc = torch.stack([linearity, planarity, scattering, normal_var, density], dim=1)
+
+        return geom_desc
+
+    def forward(self, coord, feat, radii=[0.05, 0.1, 0.2]):
+        """
+        多尺度重要性编码
+        Args:
+            coord: [N, 3] 点坐标
+            feat: [N, C] 点特征
+            radii: 不同尺度的邻域半径（这里简化为使用不同的k值）
+        Returns:
+            importance_scores: [N, 1] 重要性分数
+        """
+        N = coord.shape[0]
+        device = coord.device
+
+        # 多尺度特征
+        scale_features = []
+        k_values = [8, 16, 32]  # 不同尺度对应不同的k值
+
+        for scale_idx in range(self.num_scales):
+            k = min(k_values[scale_idx], N - 1) if N > 1 else 1
+
+            # 计算该尺度的几何描述符
+            geom_desc = self.compute_local_geometry(coord, feat, k=k)  # [N, 5]
+
+            # 拼接特征和几何描述符
+            combined = torch.cat([feat[:, :self.feat_dim], geom_desc], dim=1)  # [N, feat_dim+5]
+
+            # 编码
+            scale_feat = self.scale_encoders[scale_idx](combined)  # [N, hidden_dim//2]
+            scale_features.append(scale_feat)
+
+        # 聚合多尺度特征
+        multi_scale_feat = torch.cat(scale_features, dim=1)  # [N, hidden_dim//2 * num_scales]
+
+        # 预测重要性分数
+        importance_scores = self.aggregator(multi_scale_feat)  # [N, 1]
+
+        return importance_scores.squeeze(-1)  # [N]
+
+
+class MultiPathSerializationGenerator(nn.Module):
+    """
+    多路径序列化策略生成器
+    生成K种不同的序列化策略
+    """
+    def __init__(self, num_paths=5):
+        super().__init__()
+        self.num_paths = num_paths
+
+    def morton_encode(self, coord, bits=10):
+        """Z-order (Morton) 曲线编码"""
+        # 归一化到 [0, 2^bits)
+        coord_normalized = (coord - coord.min(dim=0)[0]) / (coord.max(dim=0)[0] - coord.min(dim=0)[0] + 1e-8)
+        coord_int = (coord_normalized * (2 ** bits - 1)).long()
+
+        # Morton码交错
+        def interleave_bits(x, y, z):
+            """交错3个数的比特位"""
+            answer = 0
+            for i in range(bits):
+                answer |= ((x & (1 << i)) << (2 * i)) | \
+                         ((y & (1 << i)) << (2 * i + 1)) | \
+                         ((z & (1 << i)) << (2 * i + 2))
+            return answer
+
+        morton_codes = []
+        for i in range(coord_int.shape[0]):
+            code = interleave_bits(
+                coord_int[i, 0].item(),
+                coord_int[i, 1].item(),
+                coord_int[i, 2].item()
+            )
+            morton_codes.append(code)
+
+        return torch.tensor(morton_codes, device=coord.device)
+
+    def generate_paths(self, coord, importance_scores, density_scores):
+        """
+        生成K种序列化路径
+        Args:
+            coord: [N, 3] 点坐标
+            importance_scores: [N] 重要性分数
+            density_scores: [N] 密度分数
+        Returns:
+            paths: List of [N] 每个路径的排列索引
+        """
+        N = coord.shape[0]
+        device = coord.device
+        paths = []
+
+        # Path 0: Z-order曲线
+        morton_codes = self.morton_encode(coord)
+        path_zorder = torch.argsort(morton_codes)
+        paths.append(path_zorder)
+
+        # Path 1: Hilbert曲线（简化版：使用改进的Z-order）
+        # 真实的Hilbert曲线实现较复杂，这里用旋转的Z-order近似
+        coord_rotated = coord[:, [1, 2, 0]]  # 旋转坐标轴
+        morton_codes_rot = self.morton_encode(coord_rotated)
+        path_hilbert = torch.argsort(morton_codes_rot)
+        paths.append(path_hilbert)
+
+        # Path 2: 重要性优先序列化
+        path_importance = torch.argsort(importance_scores, descending=True)
+        paths.append(path_importance)
+
+        # Path 3: 密度自适应序列化
+        path_density = torch.argsort(density_scores, descending=True)
+        paths.append(path_density)
+
+        # Path 4: 几何感知随机游走（简化版：加权随机排列）
+        # 使用重要性作为权重的随机采样
+        weights = importance_scores + 0.1  # 避免零权重
+        path_random = torch.multinomial(weights, N, replacement=False)
+        paths.append(path_random)
+
+        return paths
+
+
+class DynamicRoutingNetwork(nn.Module):
+    """
+    几何条件化动态路由网络
+    根据局部几何特性动态分配路径权重
+    """
+    def __init__(self, feat_dim=32, num_paths=5, num_blocks=200, hidden_dim=256, temperature=1.0):
+        super().__init__()
+        self.num_paths = num_paths
+        self.num_blocks = num_blocks
+        self.temperature = temperature
+
+        # 门控网络（输入：特征+几何描述符+重要性，输出：K路径的权重）
+        self.gate_network = nn.Sequential(
+            nn.Linear(feat_dim + 5 + 1, hidden_dim),  # feat + geom_desc(5) + importance(1)
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_paths)
+        )
+
+        # 负载均衡loss权重
+        self.balance_loss_weight = 0.01
+
+    def compute_block_features(self, feat, geom_desc, importance_scores, block_assignment):
+        """
+        计算每个块的聚合特征
+        Args:
+            feat: [N, C] 点特征
+            geom_desc: [N, 5] 几何描述符
+            importance_scores: [N] 重要性分数
+            block_assignment: [N] 每个点所属的块ID
+        Returns:
+            block_feat: [M, C+5+1] 块特征（M为块数量）
+        """
+        N = feat.shape[0]
+        M = block_assignment.max().item() + 1
+        device = feat.device
+
+        # 拼接特征
+        combined = torch.cat([
+            feat,
+            geom_desc,
+            importance_scores.unsqueeze(-1)
+        ], dim=1)  # [N, C+5+1]
+
+        # 聚合到块
+        block_feat = torch.zeros(M, combined.shape[1], device=device)
+        for m in range(M):
+            mask = block_assignment == m
+            if mask.sum() > 0:
+                # 使用最大池化聚合特征，平均池化聚合几何描述符
+                feat_part = scatter_max(feat[mask], torch.zeros(mask.sum(), dtype=torch.long, device=device), dim=0)[0]
+                geom_part = scatter_mean(geom_desc[mask], torch.zeros(mask.sum(), dtype=torch.long, device=device), dim=0)
+                importance_part = scatter_mean(importance_scores[mask].unsqueeze(-1),
+                                              torch.zeros(mask.sum(), dtype=torch.long, device=device), dim=0)
+                block_feat[m] = torch.cat([feat_part[0], geom_part[0], importance_part[0]], dim=0)
+
+        return block_feat
+
+    def forward(self, feat, geom_desc, importance_scores, block_assignment):
+        """
+        计算动态路由权重
+        Args:
+            feat: [N, C] 点特征
+            geom_desc: [N, 5] 几何描述符
+            importance_scores: [N] 重要性分数
+            block_assignment: [N] 每个点所属的块ID
+        Returns:
+            routing_weights: [M, K] 每个块的路由权重
+            balance_loss: 负载均衡损失
+        """
+        # 计算块特征
+        block_feat = self.compute_block_features(feat, geom_desc, importance_scores, block_assignment)
+        M = block_feat.shape[0]
+
+        # 门控网络计算logits
+        logits = self.gate_network(block_feat)  # [M, K]
+
+        # Softmax + 温度缩放
+        routing_weights = F.softmax(logits / self.temperature, dim=-1)  # [M, K]
+
+        # 负载均衡损失
+        avg_usage = routing_weights.mean(dim=0)  # [K]
+        uniform_usage = torch.ones_like(avg_usage) / self.num_paths
+        balance_loss = ((avg_usage - uniform_usage) ** 2).sum()
+
+        return routing_weights, balance_loss
+
+
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
         super().__init__()
@@ -126,6 +438,8 @@ class SerializedAttention(PointModule):
             area_num=2,
             use_asd_ssm=True,  # 🆕 控制是否使用ASD-SSM
             num_scales=2,      # 🆕 ASD-SSM的尺度数量
+            use_masa=False,    # 🆕 控制是否使用MASA
+            num_paths=5,       # 🆕 MASA的路径数量
 
     ):
         super().__init__()
@@ -143,6 +457,8 @@ class SerializedAttention(PointModule):
         self.area_num = area_num
         self.use_asd_ssm = use_asd_ssm  # 🆕 保存配置
         self.num_scales = num_scales    # 🆕 保存尺度数量
+        self.use_masa = use_masa        # 🆕 MASA配置
+        self.num_paths = num_paths      # 🆕 路径数量
 
         if enable_flash:
             assert (
@@ -176,8 +492,46 @@ class SerializedAttention(PointModule):
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
 
+        # 🆕 MASA模块初始化
+        if use_masa:
+            # 重要性场预测器
+            self.importance_encoder = GeometricImportanceEncoder(
+                feat_dim=channels,
+                hidden_dim=128,
+                num_scales=3
+            )
+
+            # 多路径序列化生成器
+            self.path_generator = MultiPathSerializationGenerator(num_paths=num_paths)
+
+            # 动态路由网络
+            self.routing_network = DynamicRoutingNetwork(
+                feat_dim=channels,
+                num_paths=num_paths,
+                hidden_dim=256,
+                temperature=1.0
+            )
+
+            # 为每个路径创建独立的Mamba块（或共享）
+            self.path_mambas = nn.ModuleList([
+                MambaBlock(
+                    dim=channels,
+                    layer_idx=None,
+                    bimamba_type='v2',
+                    norm_cls=partial(RMSNorm, eps=1e-5),
+                    fused_add_norm=True,
+                    residual_in_fp32=True,
+                    drop_path=0
+                ) for _ in range(num_paths)
+            ])
+
+            # 路径嵌入（类似order prompt）
+            self.path_embeddings = nn.Embedding(num_paths, channels)
+
+            print(f"🚀 Layer {layer_idx}: Using MASA with {num_paths} paths")
+
         # 🆕 根据配置选择使用原始Mamba或ASD-SSM
-        if use_asd_ssm:
+        elif use_asd_ssm:
             # 使用ASD-SSM Wrapper
             self.asd_ssm_wrapper = ASDSSMWrapper(
                 channels=channels,
@@ -337,6 +691,94 @@ class SerializedAttention(PointModule):
             )
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
+    def forward_masa(self, point, K, C):
+        """
+        MASA多路径自适应序列化的前向传播
+        """
+        N = point.feat.shape[0]
+        device = point.feat.device
+
+        # 1. 预测重要性场
+        importance_scores = self.importance_encoder(point.coord, point.feat)  # [N]
+
+        # 2. 计算几何描述符（用于路由和密度计算）
+        geom_desc = self.importance_encoder.compute_local_geometry(
+            point.coord, point.feat, k=16
+        )  # [N, 5]
+        density_scores = geom_desc[:, -1]  # 最后一维是密度
+
+        # 3. 生成多路径序列化
+        paths = self.path_generator.generate_paths(
+            point.coord, importance_scores, density_scores
+        )  # List of [N] tensors
+
+        # 4. 创建块分配（简化版：基于网格体素）
+        # 使用 grid_coord 进行块分配
+        grid_size = 0.5  # 可以作为参数
+        grid_coord_normalized = (point.coord / grid_size).long()
+        # 为每个唯一的grid坐标分配块ID
+        unique_grids, block_assignment = torch.unique(
+            grid_coord_normalized[:, 0] * 10000 +
+            grid_coord_normalized[:, 1] * 100 +
+            grid_coord_normalized[:, 2],
+            return_inverse=True
+        )  # block_assignment: [N]
+
+        # 5. 动态路由：计算每个块的路径权重
+        routing_weights, balance_loss = self.routing_network(
+            point.feat, geom_desc, importance_scores, block_assignment
+        )  # [M, K], scalar
+
+        # 保存balance_loss用于训练
+        point.masa_balance_loss = balance_loss
+
+        # 6. 多路径Mamba处理
+        path_features = []
+        for path_idx, path in enumerate(paths):
+            # 获取该路径的序列化顺序
+            pad, unpad, cu_seqlens = self.get_padding_and_inverse(point, K, 0)
+
+            # 使用路径索引重新排序
+            ordered_feat = point.feat[path][pad]
+            x = ordered_feat.reshape(-1, K, C)
+            x_res = None
+
+            # 添加路径嵌入（类似order prompt）
+            path_emb = self.path_embeddings(torch.tensor(path_idx, device=device))
+            path_emb = path_emb.unsqueeze(0).unsqueeze(0).repeat(x.shape[0], 1, 1)
+            x = torch.cat([path_emb, x], dim=1)
+
+            # 通过对应的Mamba块
+            x, x_res = self.path_mambas[path_idx](x, x_res)
+
+            # 移除路径嵌入
+            x = x[:, 1:]
+            x = x.reshape(-1, C)
+
+            # 恢复原始顺序
+            inverse_path = torch.argsort(path)
+            feat_path = x[unpad][inverse_path]
+
+            path_features.append(feat_path)  # [N, C]
+
+        # 7. 基于路由权重融合多路径特征
+        # 为每个点分配其所属块的路由权重
+        point_routing_weights = routing_weights[block_assignment]  # [N, num_paths]
+
+        # 堆叠所有路径特征
+        stacked_features = torch.stack(path_features, dim=1)  # [N, num_paths, C]
+
+        # 加权融合
+        fused_feat = (stacked_features * point_routing_weights.unsqueeze(-1)).sum(dim=1)  # [N, C]
+
+        # 8. FFN
+        feat = self.proj(torch.cat([fused_feat, fused_feat], dim=1))  # 保持原有的concat逻辑
+        feat = self.mlp(feat)
+        feat = self.proj_drop(feat)
+
+        point.feat = feat
+        return point
+
     def forward(self, point):
         if not self.enable_flash:
             self.current_patch_size = min(
@@ -347,6 +789,11 @@ class SerializedAttention(PointModule):
         H = self.num_heads
         K = self.current_patch_size
         C = self.channels  # 通道数
+
+        # 🆕 MASA多路径自适应序列化
+        if self.use_masa:
+            return self.forward_masa(point, K, C)
+
         # 已完成：动态patch，每个batch的点数量都大于patch_size时，patch_size为我们预先设置好的最大值，也就是self.patch_size
         # 已完成：有任何一个batch的点连一个patch_size都不到，那么patch_size就是这个batch的点数。
         # ===========顺序特征================
@@ -501,6 +948,8 @@ class Block(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             drop_path_rate=0.1,  # 新增
+            use_masa=False,      # 🆕 MASA配置
+            num_paths=5,         # 🆕 MASA路径数量
     ):
         super().__init__()
         self.channels = channels
@@ -539,6 +988,8 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            use_masa=use_masa,        # 🆕 传递MASA配置
+            num_paths=num_paths,      # 🆕 传递路径数量
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -1430,6 +1881,8 @@ class PointTransformerV3(PointModule):
             pdnorm_adaptive=False,
             pdnorm_affine=True,
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            use_masa=False,        # 🆕 是否使用MASA
+            masa_num_paths=5,      # 🆕 MASA路径数量
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1527,6 +1980,8 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        use_masa=use_masa,           # 🆕 传递MASA配置
+                        num_paths=masa_num_paths,    # 🆕 传递路径数量
                     ),
                     name=f"block{i}",
                 )
@@ -1579,6 +2034,8 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            use_masa=use_masa,           # 🆕 传递MASA配置
+                            num_paths=masa_num_paths,    # 🆕 传递路径数量
                         ),
                         name=f"block{i}",
                     )
