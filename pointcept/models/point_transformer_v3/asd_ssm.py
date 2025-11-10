@@ -35,7 +35,7 @@ class ScaleAwareParameterGenerator(nn.Module):
         self.num_scales = num_scales
         self.use_global_feature = use_global_feature
 
-        # 全局特征提取器（分析整体点云特性）
+        # 全局特征提取器（分析每个patch内的整体点云特性）
         if use_global_feature:
             self.global_feature_extractor = nn.Sequential(
                 nn.AdaptiveAvgPool1d(1),
@@ -85,6 +85,9 @@ class ScaleAwareParameterGenerator(nn.Module):
             delta_B: (N, C) B矩阵的偏移量
             delta_C: (N, C) C矩阵的偏移量
             scale_info: dict 包含尺度相关信息（用于可视化和分析）
+
+            delta_A、delta_B、delta_C、delta_t三者本源都是由condition通过MLP生成，condition又是由每个patch的整体特征global_feat（池化）和尺度编码拼接而成（可学习的参数，区别不同尺度，相当于尺度的可学习表示）
+            特别的，delta_A，delta_t根据尺度被做了约束，尺度越大，delta_t时间步越大，尺度越大，delta_A偏移量也越大。
         """
         N, L, C = features.shape
         device = features.device
