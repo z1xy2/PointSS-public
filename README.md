@@ -2,7 +2,7 @@
 
 **Point Cloud Semantic Segmentation with GGAM and ASD-SSM**
 
-This repository contains the implementation of our point cloud semantic segmentation framework based on Point Transformer V3, incorporating two novel modules: Global-Guided Attention Module (GGAM) and Adaptive State Space Module (ASD-SSM) with MASA enhancement. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including ScanNet, S3DIS, and nuScenes.
+This repository contains the implementation of our point cloud semantic segmentation framework PointSS, incorporating two novel modules: Global-Guided Attention Module (GGAM) and Adaptive State Space Module (ASD-SSM) with MASA enhancement. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including  S3DIS, and ModelNet40.
 
 ## News
 - **[2024-11]** Project code released with GGAM and ASD-SSM modules
