@@ -4,11 +4,15 @@ Geometry-Semantic Dual-Path State Space Model for Point Cloud Processing
 创新点：双路径处理 - 空间域（序列化）+ 几何域（平滑度排序）
 与ASD-SSM互补：ASD-SSM关注尺度，本方法关注几何特性
 
-时间复杂度保证：所有操作 ≤ O(N log N)
-- 几何特征提取: O(N log N) (kNN)
+时间复杂度保证：完全O(N)复杂度！
+- 几何特征提取: O(N) (序列化邻域，零kNN)
 - 序列化: O(N)
 - Mamba处理: O(N)
 - 跨域交互: O(N)
+
+核心优化：用序列化邻域替代kNN
+- Hilbert/Z-order的空间局部性保证序列邻域≈欧氏邻域
+- 复用已有的序列化结构，零额外开销
 
 Author: Claude Code
 Date: 2026-01-15
@@ -17,104 +21,16 @@ Date: 2026-01-15
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_cluster import knn
 from torch_scatter import scatter_mean, scatter_max, scatter_add
 import numpy as np
 from typing import Optional, Tuple, List
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 from openpoints.models.PCM.mamba_layer import MambaBlock
+from .serialized_geometry_extractor import EfficientSerializedGeometricFeatureExtractor
 
 
-class GeometricFeatureExtractor(nn.Module):
-    """
-    局部几何特征提取器
-
-    提取5个经典几何特征（基于PCA）：
-    1. Linearity (λ1 - λ2) / λ1: 线性度
-    2. Planarity (λ2 - λ3) / λ1: 平面性
-    3. Scattering λ3 / λ1: 散度
-    4. Curvature λ3 / (λ1 + λ2 + λ3): 曲率
-    5. Density: 局部点密度
-
-    时间复杂度: O(N log N) - kNN搜索
-    """
-
-    def __init__(self, k: int = 16):
-        """
-        Args:
-            k: 邻域大小
-        """
-        super().__init__()
-        self.k = k
-
-    def forward(self, coords: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            coords: [N, 3] - 点云坐标
-            offset: [B] - batch偏移量
-
-        Returns:
-            geometry_features: [N, 5] - [linearity, planarity, scattering, curvature, density]
-        """
-        N = coords.shape[0]
-        device = coords.device
-
-        # 构建batch索引
-        batch = torch.zeros(N, dtype=torch.long, device=device)
-        for i in range(len(offset)):
-            start = 0 if i == 0 else offset[i-1]
-            end = offset[i]
-            batch[start:end] = i
-
-        # kNN搜索 - O(N log N)
-        _, knn_indices = knn(coords, coords, self.k, batch, batch)
-        knn_indices = knn_indices.reshape(N, self.k)
-
-        # 提取邻域点
-        neighbor_coords = coords[knn_indices]  # [N, k, 3]
-
-        # 中心化
-        centroid = neighbor_coords.mean(dim=1, keepdim=True)  # [N, 1, 3]
-        centered = neighbor_coords - centroid  # [N, k, 3]
-
-        # 计算协方差矩阵 - [N, 3, 3]
-        cov = torch.bmm(centered.transpose(1, 2), centered) / self.k  # [N, 3, 3]
-
-        # PCA特征分解 - O(N) (每个点3x3矩阵)
-        try:
-            eigenvalues, _ = torch.linalg.eigh(cov)  # [N, 3]
-            eigenvalues = eigenvalues.abs()  # 确保非负
-            # 从小到大排序，取反得到从大到小
-            eigenvalues, _ = torch.sort(eigenvalues, dim=1, descending=True)
-        except:
-            # 数值不稳定时的回退方案
-            eigenvalues = torch.ones(N, 3, device=device) / 3.0
-
-        # λ1 >= λ2 >= λ3
-        lambda1 = eigenvalues[:, 0] + 1e-8  # 避免除零
-        lambda2 = eigenvalues[:, 1] + 1e-8
-        lambda3 = eigenvalues[:, 2] + 1e-8
-
-        # 计算几何特征
-        linearity = (lambda1 - lambda2) / lambda1  # [N]
-        planarity = (lambda2 - lambda3) / lambda1  # [N]
-        scattering = lambda3 / lambda1  # [N]
-        curvature = lambda3 / (lambda1 + lambda2 + lambda3)  # [N]
-
-        # 密度：平均到最近邻的距离的倒数
-        distances = torch.norm(centered, dim=2)  # [N, k]
-        mean_distance = distances.mean(dim=1) + 1e-8  # [N]
-        density = 1.0 / mean_distance  # [N]
-
-        # 归一化到[0, 1]
-        density = density / (density.max() + 1e-8)
-
-        # 组合特征
-        geometry_features = torch.stack([
-            linearity, planarity, scattering, curvature, density
-        ], dim=1)  # [N, 5]
-
-        return geometry_features
+# 旧的kNN版本已被序列化邻域版本替代
+# 见 serialized_geometry_extractor.py
 
 
 class GeometrySemanticDualPathSSM(nn.Module):
@@ -162,8 +78,8 @@ class GeometrySemanticDualPathSSM(nn.Module):
         self.k = k
         self.use_cross_attention = use_cross_attention
 
-        # 几何特征提取器
-        self.geometry_extractor = GeometricFeatureExtractor(k=k)
+        # 几何特征提取器（优化版：零kNN，纯O(N)）
+        self.geometry_extractor = EfficientSerializedGeometricFeatureExtractor(k=k)
 
         # 几何特征编码器（将5维几何特征融入点特征）
         self.geometry_encoder = nn.Sequential(
@@ -270,8 +186,9 @@ class GeometrySemanticDualPathSSM(nn.Module):
         N, D = x.shape
         device = x.device
 
-        # ========== 提取几何特征 ==========
-        geometry_features = self.geometry_extractor(coords, offset)  # [N, 5]
+        # ========== 提取几何特征（零kNN，纯O(N)） ==========
+        # 使用序列化邻域替代kNN
+        geometry_features = self.geometry_extractor(coords, spatial_order, offset)  # [N, 5]
 
         # ========== 路径1：空间域 ==========
         # 使用已有的空间序列化
