@@ -38,6 +38,9 @@ from pointcept.models.utils.serialization import encode, decode
 # 🆕 导入ASD-SSM模块
 from .integrate_asd_ssm import ASDSSMWrapper
 
+# 🆕 导入Geometry-Semantic Dual-Path SSM模块
+from .geometry_semantic_dual_path import GeometrySemanticDualPathSSM
+
 
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
@@ -124,8 +127,10 @@ class SerializedAttention(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             area_num=2,
-            use_asd_ssm=True,  # 🆕 控制是否使用ASD-SSM
-            num_scales=2,      # 🆕 ASD-SSM的尺度数量
+            use_asd_ssm=False,  # 🆕 控制是否使用ASD-SSM
+            num_scales=2,       # 🆕 ASD-SSM的尺度数量
+            use_geometry_semantic=False,  # 🆕 控制是否使用Geometry-Semantic Dual-Path
+            geometry_k=16,      # 🆕 几何特征提取的邻域大小
 
     ):
         super().__init__()
@@ -143,6 +148,7 @@ class SerializedAttention(PointModule):
         self.area_num = area_num
         self.use_asd_ssm = use_asd_ssm  # 🆕 保存配置
         self.num_scales = num_scales    # 🆕 保存尺度数量
+        self.use_geometry_semantic = use_geometry_semantic  # 🆕 保存配置
 
         if enable_flash:
             assert (
@@ -176,8 +182,17 @@ class SerializedAttention(PointModule):
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
 
-        # 🆕 根据配置选择使用原始Mamba或ASD-SSM
-        if use_asd_ssm:
+        # 🆕 根据配置选择使用原始Mamba、ASD-SSM或Geometry-Semantic Dual-Path
+        if use_geometry_semantic:
+            # 使用Geometry-Semantic Dual-Path SSM
+            self.geometry_semantic_ssm = GeometrySemanticDualPathSSM(
+                d_model=channels,
+                d_state=16,
+                k=geometry_k,
+                use_cross_attention=True
+            )
+            print(f"🌟 Layer {layer_idx}: Using Geometry-Semantic Dual-Path SSM (k={geometry_k})")
+        elif use_asd_ssm:
             # 使用ASD-SSM Wrapper
             self.asd_ssm_wrapper = ASDSSMWrapper(
                 channels=channels,
@@ -338,6 +353,22 @@ class SerializedAttention(PointModule):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
+        # 🆕 如果使用Geometry-Semantic Dual-Path SSM，使用简化流程
+        if self.use_geometry_semantic:
+            # 获取空间序列化顺序（使用当前的order_index）
+            spatial_order = point.serialized_order[self.order_index]
+
+            # 调用Geometry-Semantic Dual-Path SSM
+            point.feat = self.geometry_semantic_ssm(
+                x=point.feat,
+                coords=point.coord,
+                offset=point.offset,
+                spatial_order=spatial_order
+            )
+
+            return point
+
+        # 原有的Mamba/ASD-SSM流程
         if not self.enable_flash:
             self.current_patch_size = min(
                 offset2bincount(point.offset).min().tolist(), self.patch_size_max
@@ -501,6 +532,8 @@ class Block(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             drop_path_rate=0.1,  # 新增
+            use_geometry_semantic=False,  # 🆕
+            geometry_k=16,  # 🆕
     ):
         super().__init__()
         self.channels = channels
@@ -539,6 +572,8 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            use_geometry_semantic=use_geometry_semantic,  # 🆕
+            geometry_k=geometry_k,  # 🆕
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -1430,6 +1465,8 @@ class PointTransformerV3(PointModule):
             pdnorm_adaptive=False,
             pdnorm_affine=True,
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            use_geometry_semantic=False,  # 🆕 是否使用Geometry-Semantic Dual-Path SSM
+            geometry_k=16,  # 🆕 几何特征提取的邻域大小
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1527,6 +1564,8 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        use_geometry_semantic=use_geometry_semantic,  # 🆕
+                        geometry_k=geometry_k,  # 🆕
                     ),
                     name=f"block{i}",
                 )
@@ -1576,6 +1615,14 @@ class PointTransformerV3(PointModule):
                             order_index=i % len(self.order),
                             cpe_indice_key=f"stage{s}",
                             enable_rpe=enable_rpe,
+                            enable_flash=enable_flash,
+                            upcast_attention=upcast_attention,
+                            upcast_softmax=upcast_softmax,
+                            use_geometry_semantic=use_geometry_semantic,  # 🆕
+                            geometry_k=geometry_k,  # 🆕
+                        ),
+                        name=f"block{i}",
+                    )
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
