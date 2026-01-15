@@ -1623,12 +1623,6 @@ class PointTransformerV3(PointModule):
                         ),
                         name=f"block{i}",
                     )
-                            enable_flash=enable_flash,
-                            upcast_attention=upcast_attention,
-                            upcast_softmax=upcast_softmax,
-                        ),
-                        name=f"block{i}",
-                    )
                 self.dec.add(module=dec, name=f"dec{s}")
 
     def forward(self, data_dict):
