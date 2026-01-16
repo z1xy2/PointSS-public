@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch_scatter import scatter_mean, scatter_max, scatter_add
 import numpy as np
 from typing import Optional, Tuple, List
+from functools import partial
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 from openpoints.models.PCM.mamba_layer import MambaBlock
 from .serialized_geometry_extractor import EfficientSerializedGeometricFeatureExtractor
@@ -89,20 +90,34 @@ class GeometrySemanticDualPathSSM(nn.Module):
         )
 
         # 路径1：空间域Mamba
+        # SSM配置参数需要放在ssm_cfg字典中
+        ssm_cfg = {
+            'd_state': d_state,
+            'd_conv': d_conv,
+            'expand': expand
+        }
         self.spatial_mamba = MambaBlock(
             dim=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand
+            layer_idx=None,  # 不需要layer_idx（无缓存）
+            bimamba_type='v2',
+            norm_cls=partial(RMSNorm, eps=1e-5),
+            fused_add_norm=True,
+            residual_in_fp32=True,
+            drop_path=dropout,
+            ssm_cfg=ssm_cfg
         )
         self.spatial_norm = RMSNorm(d_model)
 
         # 路径2：几何域Mamba
         self.geometry_mamba = MambaBlock(
             dim=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand
+            layer_idx=None,
+            bimamba_type='v2',
+            norm_cls=partial(RMSNorm, eps=1e-5),
+            fused_add_norm=True,
+            residual_in_fp32=True,
+            drop_path=dropout,
+            ssm_cfg=ssm_cfg
         )
         self.geometry_norm = RMSNorm(d_model)
 
@@ -197,7 +212,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
 
         # Mamba处理（需要[B, L, D]格式，这里batch=1）
         x_spatial = x_spatial.unsqueeze(0)  # [1, N, D]
-        x_spatial_out = self.spatial_mamba(x_spatial)[0]  # [1, N, D]
+        x_spatial_out, _ = self.spatial_mamba(x_spatial, residual=None)  # 返回(hidden_states, residual)
         x_spatial_out = x_spatial_out.squeeze(0)  # [N, D]
 
         # 恢复原始顺序
@@ -216,7 +231,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
 
         # Mamba处理
         x_geometry = x_geometry.unsqueeze(0)  # [1, N, D]
-        x_geometry_out = self.geometry_mamba(x_geometry)[0]  # [1, N, D]
+        x_geometry_out, _ = self.geometry_mamba(x_geometry, residual=None)  # 返回(hidden_states, residual)
         x_geometry_out = x_geometry_out.squeeze(0)  # [N, D]
 
         # 恢复原始顺序
