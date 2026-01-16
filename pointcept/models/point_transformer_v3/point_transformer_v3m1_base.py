@@ -41,6 +41,9 @@ from .integrate_asd_ssm import ASDSSMWrapper
 # 🆕 导入Geometry-Semantic Dual-Path SSM模块
 from .geometry_semantic_dual_path import GeometrySemanticDualPathSSM
 
+# 🆕 导入Chebyshev Spectral SSM模块
+from .chebyshev_spectral_ssm import ChebyshevSpectralSSM
+
 
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
@@ -131,6 +134,10 @@ class SerializedAttention(PointModule):
             num_scales=2,       # 🆕 ASD-SSM的尺度数量
             use_geometry_semantic=False,  # 🆕 控制是否使用Geometry-Semantic Dual-Path
             geometry_k=16,      # 🆕 几何特征提取的邻域大小
+            use_chebyshev_spectral=False,  # 🆕 控制是否使用Chebyshev Spectral SSM
+            chebyshev_K=3,      # 🆕 Chebyshev多项式阶数
+            window_size=128,    # 🆕 窗口大小
+            spectral_k_neighbors=16,  # 🆕 频谱图的邻居数
 
     ):
         super().__init__()
@@ -149,6 +156,7 @@ class SerializedAttention(PointModule):
         self.use_asd_ssm = use_asd_ssm  # 🆕 保存配置
         self.num_scales = num_scales    # 🆕 保存尺度数量
         self.use_geometry_semantic = use_geometry_semantic  # 🆕 保存配置
+        self.use_chebyshev_spectral = use_chebyshev_spectral  # 🆕 保存配置
 
         if enable_flash:
             assert (
@@ -182,8 +190,19 @@ class SerializedAttention(PointModule):
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
 
-        # 🆕 根据配置选择使用原始Mamba、ASD-SSM或Geometry-Semantic Dual-Path
-        if use_geometry_semantic:
+        # 🆕 根据配置选择使用原始Mamba、ASD-SSM、Geometry-Semantic或Chebyshev Spectral
+        if use_chebyshev_spectral:
+            # 使用Chebyshev Spectral SSM（真正的频域）
+            self.chebyshev_spectral_ssm = ChebyshevSpectralSSM(
+                d_model=channels,
+                cheb_K=chebyshev_K,
+                window_size=window_size,
+                k_neighbors=spectral_k_neighbors,
+                d_state=16,
+                dropout=0.0
+            )
+            print(f"⚡ Layer {layer_idx}: Using Chebyshev Spectral SSM (K={chebyshev_K}, window={window_size})")
+        elif use_geometry_semantic:
             # 使用Geometry-Semantic Dual-Path SSM
             self.geometry_semantic_ssm = GeometrySemanticDualPathSSM(
                 d_model=channels,
@@ -353,6 +372,21 @@ class SerializedAttention(PointModule):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
+        # 🆕 如果使用Chebyshev Spectral SSM，使用频域流程
+        if self.use_chebyshev_spectral:
+            # 获取空间序列化顺序（使用当前的order_index）
+            spatial_order = point.serialized_order[self.order_index]
+
+            # 调用Chebyshev Spectral SSM
+            point.feat = self.chebyshev_spectral_ssm(
+                x=point.feat,
+                coords=point.coord,
+                offset=point.offset,
+                spatial_order=spatial_order
+            )
+
+            return point
+
         # 🆕 如果使用Geometry-Semantic Dual-Path SSM，使用简化流程
         if self.use_geometry_semantic:
             # 获取空间序列化顺序（使用当前的order_index）
@@ -534,6 +568,10 @@ class Block(PointModule):
             drop_path_rate=0.1,  # 新增
             use_geometry_semantic=False,  # 🆕
             geometry_k=16,  # 🆕
+            use_chebyshev_spectral=False,  # 🆕
+            chebyshev_K=3,  # 🆕
+            window_size=128,  # 🆕
+            spectral_k_neighbors=16,  # 🆕
     ):
         super().__init__()
         self.channels = channels
@@ -574,6 +612,10 @@ class Block(PointModule):
             upcast_softmax=upcast_softmax,
             use_geometry_semantic=use_geometry_semantic,  # 🆕
             geometry_k=geometry_k,  # 🆕
+            use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+            chebyshev_K=chebyshev_K,  # 🆕
+            window_size=window_size,  # 🆕
+            spectral_k_neighbors=spectral_k_neighbors,  # 🆕
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -1467,6 +1509,10 @@ class PointTransformerV3(PointModule):
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
             use_geometry_semantic=False,  # 🆕 是否使用Geometry-Semantic Dual-Path SSM
             geometry_k=16,  # 🆕 几何特征提取的邻域大小
+            use_chebyshev_spectral=False,  # 🆕 是否使用Chebyshev Spectral SSM
+            chebyshev_K=3,  # 🆕 Chebyshev多项式阶数
+            window_size=128,  # 🆕 频谱窗口大小
+            spectral_k_neighbors=16,  # 🆕 频谱图的邻居数
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1566,6 +1612,10 @@ class PointTransformerV3(PointModule):
                         upcast_softmax=upcast_softmax,
                         use_geometry_semantic=use_geometry_semantic,  # 🆕
                         geometry_k=geometry_k,  # 🆕
+                        use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+                        chebyshev_K=chebyshev_K,  # 🆕
+                        window_size=window_size,  # 🆕
+                        spectral_k_neighbors=spectral_k_neighbors,  # 🆕
                     ),
                     name=f"block{i}",
                 )
@@ -1620,6 +1670,10 @@ class PointTransformerV3(PointModule):
                             upcast_softmax=upcast_softmax,
                             use_geometry_semantic=use_geometry_semantic,  # 🆕
                             geometry_k=geometry_k,  # 🆕
+                            use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+                            chebyshev_K=chebyshev_K,  # 🆕
+                            window_size=window_size,  # 🆕
+                            spectral_k_neighbors=spectral_k_neighbors,  # 🆕
                         ),
                         name=f"block{i}",
                     )
