@@ -106,7 +106,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
             drop_path=dropout,
             ssm_cfg=ssm_cfg
         )
-        self.spatial_norm = RMSNorm(d_model)
+        # 注意：MambaBlock内部已包含归一化，无需额外的norm层
 
         # 路径2：几何域Mamba
         self.geometry_mamba = MambaBlock(
@@ -119,7 +119,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
             drop_path=dropout,
             ssm_cfg=ssm_cfg
         )
-        self.geometry_norm = RMSNorm(d_model)
+        # 注意：MambaBlock内部已包含归一化，无需额外的norm层
 
         # 跨域交互（可选）
         if use_cross_attention:
@@ -208,7 +208,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
         # ========== 路径1：空间域 ==========
         # 使用已有的空间序列化
         x_spatial = x[spatial_order]  # [N, D]
-        x_spatial = self.spatial_norm(x_spatial)
+        # MambaBlock内部会进行归一化，无需在外部归一化
 
         # Mamba处理（需要[B, L, D]格式，这里batch=1）
         x_spatial = x_spatial.unsqueeze(0)  # [1, N, D]
@@ -227,7 +227,7 @@ class GeometrySemanticDualPathSSM(nn.Module):
         # 基于几何平滑度排序
         geometry_order = self.compute_geometry_order(coords, offset, geometry_features)
         x_geometry = x_geometry[geometry_order]  # [N, D]
-        x_geometry = self.geometry_norm(x_geometry)
+        # MambaBlock内部会进行归一化，无需在外部归一化
 
         # Mamba处理
         x_geometry = x_geometry.unsqueeze(0)  # [1, N, D]
