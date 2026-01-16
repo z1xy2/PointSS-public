@@ -286,9 +286,12 @@ class EfficientSerializedGeometricFeatureExtractor(nn.Module):
 
             if batch_size < self.k:
                 # 小batch：简单处理
-                batch_coords = ordered_coords[batch_start:batch_end]
+                # ⚠️ 修复：避免使用expand，直接复制张量
+                batch_coords = ordered_coords[batch_start:batch_end]  # [batch_size, 3]
                 repeat_times = (self.k + batch_size - 1) // batch_size
-                neighborhoods = batch_coords.repeat(repeat_times, 1)[:self.k].unsqueeze(0).expand(batch_size, -1, -1)
+                repeated = batch_coords.repeat(repeat_times, 1)[:self.k]  # [k, 3]
+                # 为每个点复制相同的邻域（因为点太少）
+                neighborhoods = repeated.unsqueeze(0).repeat(batch_size, 1, 1)  # [batch_size, k, 3]
             else:
                 # 大batch：高效滑动窗口
                 batch_coords = ordered_coords[batch_start:batch_end]  # [L, 3]

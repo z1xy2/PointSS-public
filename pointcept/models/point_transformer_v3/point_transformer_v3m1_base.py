@@ -189,9 +189,9 @@ class SerializedAttention(PointModule):
                 d_model=channels,
                 d_state=16,
                 k=geometry_k,
-                use_cross_attention=True
+                use_cross_attention=False  # 🔧 暂时禁用，避免O(N²)显存爆炸
             )
-            print(f"🌟 Layer {layer_idx}: Using Geometry-Semantic Dual-Path SSM (k={geometry_k})")
+            print(f"🌟 Layer {layer_idx}: Using Geometry-Semantic Dual-Path SSM (k={geometry_k}, cross_attn=OFF)")
         elif use_asd_ssm:
             # 使用ASD-SSM Wrapper
             self.asd_ssm_wrapper = ASDSSMWrapper(
