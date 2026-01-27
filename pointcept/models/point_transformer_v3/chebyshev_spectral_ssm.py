@@ -406,39 +406,6 @@ class ChebyshevSpectralSSM(nn.Module):
 
         print(f"  ✅ 初始化 {cheb_K} 个频段Mamba（T₀ 到 T_{cheb_K-1}）")
 
-    def compute_frequency_order_for_band(
-        self,
-        x_band: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_weight: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        为某个频段计算频率排序
-
-        Args:
-            x_band: [N, D] - 频段特征
-            edge_index: [2, E]
-            edge_weight: [E]
-
-        Returns:
-            frequency_order: [N] - 排序索引
-        """
-        N = x_band.shape[0]
-        device = x_band.device
-
-        row, col = edge_index
-
-        # 计算该频段内的"频率变化"
-        diff = torch.norm(x_band[row] - x_band[col], dim=1)  # [E]
-        weighted_diff = diff * edge_weight
-        frequency_scores = scatter_add(weighted_diff, row, dim=0, dim_size=N)
-
-        degree = scatter_add(edge_weight, row, dim=0, dim_size=N)
-        frequency_scores = frequency_scores / (degree + 1e-8)
-
-        # 升序排列：平滑到变化剧烈
-        return torch.argsort(frequency_scores)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -487,25 +454,15 @@ class ChebyshevSpectralSSM(nn.Module):
             # 获取第k个频段的特征
             x_freq_k = Tx_list[k]  # [N, D]
 
-            # 🆕 频段内排序（在该频段内从平滑到剧烈变化排序）
-            freq_order_k = self.compute_frequency_order_for_band(
-                x_freq_k, edge_index, edge_weight
-            )
-            x_freq_k_ordered = x_freq_k[freq_order_k]  # [N, D]
-
-            # 🆕 第k个Mamba处理第k个频段
-            x_freq_k_ordered = x_freq_k_ordered.unsqueeze(0)  # [1, N, D]
-            x_freq_k_out, _ = self.frequency_mambas[k](x_freq_k_ordered, residual=None)
+            # 🆕 第k个Mamba处理第k个频段（不排序）
+            x_freq_k = x_freq_k.unsqueeze(0)  # [1, N, D]
+            x_freq_k_out, _ = self.frequency_mambas[k](x_freq_k, residual=None)
             x_freq_k_out = x_freq_k_out.squeeze(0)  # [N, D]
 
-            # 恢复原始顺序
-            freq_inverse_k = torch.argsort(freq_order_k)
-            x_freq_k_restored = x_freq_k_out[freq_inverse_k]  # [N, D]
-
             # 归一化
-            x_freq_k_restored = self.freq_norms[k](x_freq_k_restored)
+            x_freq_k_out = self.freq_norms[k](x_freq_k_out)
 
-            freq_outputs.append(x_freq_k_restored)
+            freq_outputs.append(x_freq_k_out)
 
         # ===== 4. 可学习的加权融合K个频段 =====
         # Stack: [K, N, D]
