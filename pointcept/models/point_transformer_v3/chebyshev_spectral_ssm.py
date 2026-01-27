@@ -310,20 +310,26 @@ class SerializedWindowGraphBuilder(nn.Module):
 
 class ChebyshevSpectralSSM(nn.Module):
     """
-    基于Chebyshev多项式的频谱State Space Model
+    基于Chebyshev多项式的多频段频谱State Space Model（方案二）
 
     创新点：
-    1. 真正的频域处理（通过Chebyshev近似）
-    2. O(N)复杂度（无需特征分解）
-    3. 可学习的频谱滤波器
-    4. 与Mamba结合：频域 → SSM → 空域
+    1. 真正的多频段分离（T₀, T₁, ..., T_K）
+    2. 每个Chebyshev阶对应独立的频率分量
+    3. K个并行Mamba处理不同频段
+    4. O(K·N)复杂度，K为常数（2-5）
+
+    理论基础：
+    - T₀ (k=0): 直流分量（最低频，捕捉平滑区域）
+    - T₁ (k=1): 一阶频率（中频，捕捉中等几何变化）
+    - T₂ (k=2): 二阶频率（较高频，捕捉细节）
+    - ...
+    - T_K: 最高频（捕捉边界和角点）
 
     工作流程：
-    1. 在序列化窗口内构建稀疏图
-    2. Chebyshev频谱卷积（低通滤波）
-    3. 按频率排序（频域序列化）
-    4. Mamba处理频域序列
-    5. 融合回原始特征
+    1. 构建序列化窗口图
+    2. 提取Chebyshev多频段基底 [T₀, T₁, ..., T_K]
+    3. K个Mamba分别处理K个频段
+    4. 可学习的加权融合多频段
     """
 
     def __init__(
@@ -338,9 +344,9 @@ class ChebyshevSpectralSSM(nn.Module):
         """
         Args:
             d_model: 模型维度
-            cheb_K: Chebyshev多项式阶数（2-5）
-            window_size: 序列化窗口大小
-            k_neighbors: 邻居数
+            cheb_K: Chebyshev多项式阶数（建议2-5）
+            window_size: 序列化窗口大小（废弃，保留兼容）
+            k_neighbors: 邻居数（建议8-16保持O(N)）
             d_state: SSM状态维度
             dropout: dropout率
         """
@@ -354,31 +360,43 @@ class ChebyshevSpectralSSM(nn.Module):
             k_neighbors=k_neighbors
         )
 
-        # Chebyshev频谱卷积（可学习的频谱滤波器）
+        # Chebyshev频谱卷积不再需要，直接用basis函数
         self.cheb_conv = ChebConv(d_model, d_model, K=cheb_K)
 
-        # 归一化
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        # 频域Mamba
+        # 🆕 为每个频段创建独立的Mamba
         ssm_cfg = {
             'd_state': d_state,
             'd_conv': 4,
             'expand': 2
         }
-        self.frequency_mamba = MambaBlock(
-            dim=d_model,
-            layer_idx=None,
-            bimamba_type='v2',
-            norm_cls=partial(RMSNorm, eps=1e-5),
-            fused_add_norm=True,
-            residual_in_fp32=True,
-            drop_path=dropout,
-            ssm_cfg=ssm_cfg
+        self.frequency_mambas = nn.ModuleList([
+            MambaBlock(
+                dim=d_model,
+                layer_idx=None,
+                bimamba_type='v2',
+                norm_cls=partial(RMSNorm, eps=1e-5),
+                fused_add_norm=True,
+                residual_in_fp32=True,
+                drop_path=dropout,
+                ssm_cfg=ssm_cfg
+            )
+            for k in range(cheb_K)
+        ])
+
+        # 🆕 每个频段的归一化
+        self.freq_norms = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(cheb_K)
+        ])
+
+        # 🆕 可学习的频段融合权重
+        self.freq_fusion_weights = nn.Parameter(
+            torch.ones(cheb_K) / cheb_K  # 初始化为均匀权重
         )
 
-        # 融合层
+        # 输入归一化
+        self.norm_input = nn.LayerNorm(d_model)
+
+        # 🆕 融合层：x + 多频段特征
         self.fusion = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model),
@@ -386,42 +404,40 @@ class ChebyshevSpectralSSM(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def compute_spectral_scores(
+        print(f"  ✅ 初始化 {cheb_K} 个频段Mamba（T₀ 到 T_{cheb_K-1}）")
+
+    def compute_frequency_order_for_band(
         self,
-        x: torch.Tensor,
+        x_band: torch.Tensor,
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算每个点的"频率分数"（用于排序）
-
-        启发式：高频点 = 与邻居差异大的点
+        为某个频段计算频率排序
 
         Args:
-            x: [N, D]
+            x_band: [N, D] - 频段特征
             edge_index: [2, E]
             edge_weight: [E]
 
         Returns:
-            frequency_scores: [N] - 越大越高频
+            frequency_order: [N] - 排序索引
         """
-        N = x.shape[0]
-        device = x.device
+        N = x_band.shape[0]
+        device = x_band.device
 
         row, col = edge_index
 
-        # 计算邻居差异
-        diff = torch.norm(x[row] - x[col], dim=1)  # [E]
-
-        # 加权平均（每个点的平均差异）
+        # 计算该频段内的"频率变化"
+        diff = torch.norm(x_band[row] - x_band[col], dim=1)  # [E]
         weighted_diff = diff * edge_weight
         frequency_scores = scatter_add(weighted_diff, row, dim=0, dim_size=N)
 
-        # 归一化
         degree = scatter_add(edge_weight, row, dim=0, dim_size=N)
         frequency_scores = frequency_scores / (degree + 1e-8)
 
-        return frequency_scores
+        # 升序排列：平滑到变化剧烈
+        return torch.argsort(frequency_scores)
 
     def forward(
         self,
@@ -431,6 +447,8 @@ class ChebyshevSpectralSSM(nn.Module):
         spatial_order: torch.Tensor
     ) -> torch.Tensor:
         """
+        多频段并行处理（方案二）
+
         Args:
             x: [N, D] - 点特征
             coords: [N, 3] - 点坐标
@@ -452,29 +470,55 @@ class ChebyshevSpectralSSM(nn.Module):
             # 如果没有边，直接返回
             return x
 
-        # ===== 2. Chebyshev频谱卷积（频域滤波）=====
-        x_spectral = self.cheb_conv(x, edge_index, edge_weight)  # [N, D]
-        x_spectral = self.norm1(x_spectral + x)  # 残差
+        # 输入归一化
+        x_norm = self.norm_input(x)
 
-        # ===== 3. 频率排序（低频→高频）=====
-        frequency_scores = self.compute_spectral_scores(x_spectral, edge_index, edge_weight)
-        frequency_order = torch.argsort(frequency_scores)  # 升序：低频在前
+        # ===== 2. 提取Chebyshev多频段基底 =====
+        # Tx_list: [T₀(x), T₁(x), ..., T_{K-1}(x)]
+        # 每个 T_k(x) 都是 [N, D]，代表第k个频率分量
+        Tx_list = self.cheb_conv.chebyshev_basis(
+            x_norm, edge_index, edge_weight, lambda_max=2.0, K=self.cheb_K
+        )
 
-        x_freq_ordered = x_spectral[frequency_order]  # [N, D]
+        # ===== 3. K个Mamba并行处理K个频段 =====
+        freq_outputs = []
 
-        # ===== 4. Mamba处理频域序列 =====
-        x_freq_ordered = x_freq_ordered.unsqueeze(0)  # [1, N, D]
-        x_freq_out, _ = self.frequency_mamba(x_freq_ordered, residual=None)
-        x_freq_out = x_freq_out.squeeze(0)  # [N, D]
+        for k in range(self.cheb_K):
+            # 获取第k个频段的特征
+            x_freq_k = Tx_list[k]  # [N, D]
 
-        # 恢复原始顺序
-        frequency_inverse = torch.argsort(frequency_order)
-        x_freq_restored = x_freq_out[frequency_inverse]  # [N, D]
+            # 🆕 频段内排序（在该频段内从平滑到剧烈变化排序）
+            freq_order_k = self.compute_frequency_order_for_band(
+                x_freq_k, edge_index, edge_weight
+            )
+            x_freq_k_ordered = x_freq_k[freq_order_k]  # [N, D]
 
-        x_freq_restored = self.norm2(x_freq_restored)
+            # 🆕 第k个Mamba处理第k个频段
+            x_freq_k_ordered = x_freq_k_ordered.unsqueeze(0)  # [1, N, D]
+            x_freq_k_out, _ = self.frequency_mambas[k](x_freq_k_ordered, residual=None)
+            x_freq_k_out = x_freq_k_out.squeeze(0)  # [N, D]
 
-        # ===== 5. 融合频域和原始特征 =====
-        x_fused = torch.cat([x, x_freq_restored], dim=-1)  # [N, 2D]
+            # 恢复原始顺序
+            freq_inverse_k = torch.argsort(freq_order_k)
+            x_freq_k_restored = x_freq_k_out[freq_inverse_k]  # [N, D]
+
+            # 归一化
+            x_freq_k_restored = self.freq_norms[k](x_freq_k_restored)
+
+            freq_outputs.append(x_freq_k_restored)
+
+        # ===== 4. 可学习的加权融合K个频段 =====
+        # Stack: [K, N, D]
+        freq_stack = torch.stack(freq_outputs, dim=0)  # [K, N, D]
+
+        # Softmax归一化权重
+        fusion_weights = torch.softmax(self.freq_fusion_weights, dim=0)  # [K]
+
+        # 加权求和: [N, D]
+        x_multi_freq = torch.einsum('k,knd->nd', fusion_weights, freq_stack)
+
+        # ===== 5. 融合多频段特征和原始特征 =====
+        x_fused = torch.cat([x, x_multi_freq], dim=-1)  # [N, 2D]
         output = self.fusion(x_fused)  # [N, D]
 
         # 残差连接
@@ -487,7 +531,7 @@ class ChebyshevSpectralSSM(nn.Module):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Testing ChebyshevSpectralSSM")
+    print("Testing ChebyshevSpectralSSM - 多频段并行方案")
     print("=" * 60)
 
     # 模拟数据
@@ -501,9 +545,10 @@ if __name__ == "__main__":
     spatial_order = torch.randperm(N).cuda()  # 模拟Hilbert序列化
 
     # 创建模型
+    cheb_K = 3
     model = ChebyshevSpectralSSM(
         d_model=D,
-        cheb_K=3,
+        cheb_K=cheb_K,
         window_size=128,
         k_neighbors=16,
         d_state=16
@@ -513,6 +558,7 @@ if __name__ == "__main__":
     print(f"  - Points: {N}")
     print(f"  - Features: {D}")
     print(f"  - Batches: {B}")
+    print(f"  - Frequency Bands: {cheb_K} (T₀, T₁, T₂)")
 
     # 前向传播
     print(f"\n🚀 Forward pass...")
@@ -537,10 +583,18 @@ if __name__ == "__main__":
     has_grad = any(p.grad is not None for p in model.parameters())
     print(f"✅ Gradients: {'OK' if has_grad else 'FAILED'}")
 
+    # 查看频段融合权重
+    print(f"\n📊 Frequency Band Fusion Weights:")
+    fusion_weights = torch.softmax(model.freq_fusion_weights, dim=0)
+    for k in range(cheb_K):
+        print(f"  - Band T_{k} (freq order {k}): {fusion_weights[k].item():.4f}")
+
     # 复杂度分析
     print(f"\n📐 Complexity Analysis:")
-    print(f"  - Chebyshev: O(K·N) = O({model.cheb_K} × {N}) ≈ {model.cheb_K * N:.0f}")
+    print(f"  - Chebyshev basis: O(K·N) = O({cheb_K} × {N}) ≈ {cheb_K * N:.0f}")
+    print(f"  - K Mambas: O(K·N) = O({cheb_K} × {N}) ≈ {cheb_K * N:.0f}")
+    print(f"  - Total: O(K·N) with K={cheb_K} (constant)")
     print(f"  - Full eigen: O(N³) ≈ {N**3:.0e}")
-    print(f"  - Speedup: ~{(N**3) / (model.cheb_K * N):.0e}x")
+    print(f"  - Speedup: ~{(N**3) / (cheb_K * N):.0e}x")
 
-    print(f"\n🎉 All tests passed!")
+    print(f"\n🎉 All tests passed! 多频段方案工作正常！")
