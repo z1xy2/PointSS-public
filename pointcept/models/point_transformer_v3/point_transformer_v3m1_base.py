@@ -1310,7 +1310,7 @@ class GGAMEmbedding(nn.Module):
     GGAM Embedding：集成双序列化几何增强的嵌入层（use_ggam=True 时使用）
     """
 
-    def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None,
+    def __init__(self, in_channels, embed_channels, k=64, norm_layer=None, act_layer=None,
                  fusion_strategy='adaptive'):
         super().__init__()
         self.in_channels = in_channels
