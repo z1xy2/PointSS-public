@@ -168,8 +168,7 @@ class SerializedAttention(PointModule):
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        1
-        self.proj = torch.nn.Linear(2 * channels, channels)  # 进行了修改
+        self.proj = torch.nn.Linear(2 * channels, channels)  # 多尺度concat后投影
 
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.mlp = MLP(channels, channels)
@@ -185,28 +184,17 @@ class SerializedAttention(PointModule):
             )
             print(f"🚀 Layer {layer_idx}: Using ASD-SSM with {num_scales} scales")
         else:
-            # 使用原始Mamba
+            # 使用原始 Mamba（双路：有序路径 + 打乱路径）
             self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
                                      bimamba_type='v2',
                                      norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
                                      residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                     drop_path=0)
             self.mamba1 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
                                      bimamba_type='v2',
                                      norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
                                      residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
-            self.mamba2 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                     bimamba_type='v2',
-                                     norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
-                                     residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                     drop_path=0)
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -373,76 +361,41 @@ class SerializedAttention(PointModule):
         layer_order_prompt = layer_order_prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
         x = torch.cat([layer_order_prompt, x, layer_order_prompt], dim=1)  # 很神奇，将顺序提示当做点给添加进去了，前面六个点，后面六个点，实际都是顺序提示
 
-        # 🆕 使用ASD-SSM或原始Mamba
+        # ========= 路径1：有序序列（细尺度 scale_id=0）=========
         if self.use_asd_ssm:
-            x, x_res, scale_info_0 = self.asd_ssm_wrapper(x, scale_id=0, x_res=x_res)
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=0, x_res=x_res)
         else:
-            x, x_res = self.mamba0(x, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+            x, x_res = self.mamba0(x, x_res)
+        x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]
+        x = x.reshape(-1, C)
+        feat0 = x[inverse]
 
-        x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]  # 出来时将前后的顺序提示去掉
-        x = x.reshape(-1, C)  # 返回为非patch的情况
-        feat0 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-
-        # =============================引入随机全局特征4================================
-        pad_4, unpad_4, cu_seqlens_4 = self.get_padding_and_inverse(point, K, 1)
-
-        # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
-        order = point.serialized_order[self.order_index][pad_4]
-        inverse = unpad_4[point.serialized_inverse[self.order_index]]
-        ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
-        x = ordered_and_padded_points_feat.reshape(-1, K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        # ========= 路径2：patch内打乱（粗尺度 scale_id=1，patch_size=2K）=========
+        pad_2, unpad_2, _ = self.get_padding_and_inverse(point, 2 * K, 1)
+        order2 = point.serialized_order[self.order_index][pad_2]
+        inverse2 = unpad_2[point.serialized_inverse[self.order_index]]
+        x = point.feat[order2].reshape(-1, 2 * K, C)
         x_res = None
 
-        # 打乱同patch的特征
-        shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()  # 打乱后的下标
-        inverse_shuffle_one_patch_indices = torch.empty_like(shuffle_one_patch_indices)
-        inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(
-            x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
-        x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
+        shuffle_idx = torch.randperm(2 * K, device=x.device)
+        inv_shuffle_idx = torch.empty_like(shuffle_idx)
+        inv_shuffle_idx[shuffle_idx] = torch.arange(2 * K, device=x.device)
+        x = x.index_select(dim=1, index=shuffle_idx)
 
-        # 🆕 使用ASD-SSM或原始Mamba
         if self.use_asd_ssm:
-            x_shuffled, x_res, scale_info_1 = self.asd_ssm_wrapper(
-                x_shuffled, scale_id=1, x_res=x_res
-            )
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=1, x_res=x_res)
         else:
-            x_shuffled, x_res = self.mamba1(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+            x, x_res = self.mamba1(x, x_res)
 
-        x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
+        x = x.index_select(dim=1, index=inv_shuffle_idx)
+        x = x.reshape(-1, C)
+        feat1 = x[inverse2]
 
-        x = x.reshape(-1, C)  # 返回为非patch的情况
-        feat1 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
 
-        # # =============================引入随机全局特征16================================
-        # pad_16, unpad_16, cu_seqlens_16 = self.get_padding_and_inverse(point, 6 * K,2)
-        #
-        # # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
-        # order = point.serialized_order[self.order_index][pad_16]
-        # inverse = unpad_16[point.serialized_inverse[self.order_index]]
-        # ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
-        # x = ordered_and_padded_points_feat.reshape(-1, 6 * K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-        # x_res = None
-        #
-        # # 打乱同patch的特征
-        # shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()  # 打乱后的下标
-        # inverse_shuffle_one_patch_indices = torch.empty_like(shuffle_one_patch_indices)
-        # inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(
-        #     x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
-        # x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
-        #
-        # x_shuffled, x_res = self.mamba2(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
-        # x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
-        #
-        # x = x.reshape(-1, C)  # 返回为非patch的情况
-        # feat2 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-
-        feat = torch.concat([feat0, feat1], 1)
-
-        # ffn
+        # proj + mlp
         feat = self.proj(feat)
-
         feat = self.mlp(feat)
-
         feat = self.proj_drop(feat)
         point.feat = feat
         return point
