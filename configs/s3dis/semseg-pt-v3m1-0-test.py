@@ -44,6 +44,12 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        use_geometry_semantic=False,
+        # 🆕 Chebyshev Spectral SSM 配置
+        use_chebyshev_spectral = True,  # 启用频谱SSM
+        chebyshev_K = 3,  # 多项式阶数（2-5）
+        window_size = 128,  # 窗口大小
+        spectral_k_neighbors = 16,  # 邻居数
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
