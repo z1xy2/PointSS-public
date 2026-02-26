@@ -102,10 +102,10 @@ class ScaleAwareParameterGenerator(nn.Module):
             condition = scale_emb  # (N, C//4)
 
         # 4. 生成 Ā_s^raw，再应用 sigmoid + α_s 约束
-        # 论文公式：Ā_s = α_s · σ(0.1 · MLP([f_global ∥ e_s]))
+        # 论文公式：Ā_s = α_s · σ(λ · MLP([f_global ∥ e_s]))，λ=0.1
         A_bar_raw = self.param_generator(condition)  # (N, C)
         scale_constraint = self.scale_constraints[scale_id]
-        A_bar = scale_constraint * torch.sigmoid(A_bar_raw)  # ∈ [0, α_s]，始终非负
+        A_bar = scale_constraint * torch.sigmoid(0.1 * A_bar_raw)  # ∈ [0, α_s]，始终非负
 
         # 5. 收集尺度信息
         scale_info = {
