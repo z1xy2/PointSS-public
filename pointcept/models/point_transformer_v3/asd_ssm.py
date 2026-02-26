@@ -124,13 +124,13 @@ class ScaleAwareParameterGenerator(nn.Module):
         delta_B = self.param_norm(delta_B)
         delta_C = self.param_norm(delta_C)
 
-        # 7. 收集尺度信息（用于分析和可视化）
+        # 7. 收集尺度信息（保留tensor，避免.item()造成的GPU-CPU同步）
         scale_info = {
             'scale_id': scale_id,
-            'scale_constraint': scale_constraint.item(),
-            'delta_A_mean': delta_A.mean().item(),
-            'delta_A_std': delta_A.std().item(),
-            'global_feat_norm': global_feat.norm(dim=-1).mean().item() if self.use_global_feature else 0.0
+            'scale_constraint': scale_constraint,
+            'delta_A_mean': delta_A.mean(),
+            'delta_A_std': delta_A.std(),
+            'global_feat_norm': global_feat.norm(dim=-1).mean() if self.use_global_feature else 0.0
         }
 
         return delta_A, delta_B, delta_C, scale_info
@@ -237,9 +237,9 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
         # 🆕 7. 提取最终隐状态（最后一个时间步的输出作为隐状态）
         h_final = output[:, -1, :].clone()  # (N, C)
 
-        # 8. 添加输出统计到scale_info
-        scale_info['output_norm'] = output.norm(dim=-1).mean().item()
-        scale_info['h_final_norm'] = h_final.norm(dim=-1).mean().item()
+        # 8. 添加输出统计到scale_info（保留tensor，避免GPU-CPU同步）
+        scale_info['output_norm'] = output.norm(dim=-1).mean()
+        scale_info['h_final_norm'] = h_final.norm(dim=-1).mean()
 
         return output, x_res, h_final, scale_info
 
