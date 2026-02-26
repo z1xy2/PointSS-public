@@ -20,11 +20,11 @@ model = dict(
         enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(128, 128, 128, 128, 128),
+        enc_patch_size=(512, 512, 512, 128, 128),
         dec_depths=(2, 2, 2, 2),
         dec_channels=(64, 64, 128, 256),
         dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(128, 128, 128, 128),
+        dec_patch_size=(512, 512, 128, 128),
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
@@ -44,12 +44,8 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-        use_geometry_semantic=False,
-        # 🆕 Chebyshev Spectral SSM 配置
-        use_chebyshev_spectral = True,  # 启用频谱SSM
-        chebyshev_K = 3,  # 多项式阶数（2-5）
-        window_size = 128,  # 窗口大小
-        spectral_k_neighbors = 16,  # 邻居数
+        use_ggam=True,      # GGAM Embedding（False=原版SubMConv3d）
+        use_asd_ssm=True,   # ASD-SSM（False=原版Mamba）
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
