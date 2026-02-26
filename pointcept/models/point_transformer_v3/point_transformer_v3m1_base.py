@@ -501,6 +501,7 @@ class Block(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             drop_path_rate=0.1,  # 新增
+            use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
     ):
         super().__init__()
         self.channels = channels
@@ -539,6 +540,7 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            use_asd_ssm=use_asd_ssm,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -561,15 +563,8 @@ class Block(PointModule):
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
-        # x, x_res = self.mamba(x, x_res)
 
-        time_start = datetime.datetime.now()
         point = self.attn(point)
-        time_end = datetime.datetime.now()
-        time_latecy = time_end - time_start
-
-        self.count += 1
-        # self.latecyLogger.info(time_latecy)
 
         point = self.drop_path(point)
         point.feat = shortcut + point.feat
@@ -1327,9 +1322,39 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         return enhanced_coords, enhanced_geom, attention_info
 
 
-class Embedding(nn.Module):
+class OriginalEmbedding(PointModule):
     """
-    集成双序列化几何增强的优化嵌入层
+    PTv3 原版 Embedding（SubMConv3d，use_ggam=False 时使用）
+    """
+
+    def __init__(self, in_channels, embed_channels, norm_layer=None, act_layer=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_channels = embed_channels
+
+        self.stem = PointSequential(
+            conv=spconv.SubMConv3d(
+                in_channels,
+                embed_channels,
+                kernel_size=5,
+                padding=1,
+                bias=False,
+                indice_key="stem",
+            )
+        )
+        if norm_layer is not None:
+            self.stem.add(norm_layer(embed_channels), name="norm")
+        if act_layer is not None:
+            self.stem.add(act_layer(), name="act")
+
+    def forward(self, point: Point):
+        point = self.stem(point)
+        return point
+
+
+class GGAMEmbedding(nn.Module):
+    """
+    GGAM Embedding：集成双序列化几何增强的嵌入层（use_ggam=True 时使用）
     """
 
     def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None,
@@ -1364,10 +1389,6 @@ class Embedding(nn.Module):
             self.act = nn.Identity()
 
     def forward(self, point):
-        """
-        Args:
-            point: Point对象（需要包含Z-order和Hilbert两种序列化顺序）
-        """
         # 1. 双序列化几何增强
         enhanced_coords, enhanced_geom, attention_info = self.dual_geom_enhancer(point)
 
@@ -1375,7 +1396,6 @@ class Embedding(nn.Module):
         if hasattr(point, 'feat') and point.feat is not None:
             combined_feat = torch.cat([point.feat, enhanced_geom], dim=-1)
         else:
-            # 如果没有原始特征，使用坐标作为基础特征
             combined_feat = torch.cat([point.coord, enhanced_geom], dim=-1)
 
         # 3. 特征融合
@@ -1394,6 +1414,10 @@ class Embedding(nn.Module):
             point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
 
         return point
+
+
+# 保留别名，兼容旧代码
+Embedding = GGAMEmbedding
 
 
 @MODELS.register_module("PT-v3m1")
@@ -1430,6 +1454,8 @@ class PointTransformerV3(PointModule):
             pdnorm_adaptive=False,
             pdnorm_affine=True,
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            use_ggam=True,       # 是否使用GGAM Embedding（False=原版SubMConv3d Embedding）
+            use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1473,12 +1499,20 @@ class PointTransformerV3(PointModule):
         # activation layers
         act_layer = nn.GELU
 
-        self.embedding = Embedding(
-            in_channels=in_channels,
-            embed_channels=enc_channels[0],
-            norm_layer=bn_layer,
-            act_layer=act_layer,
-        )
+        if use_ggam:
+            self.embedding = GGAMEmbedding(
+                in_channels=in_channels,
+                embed_channels=enc_channels[0],
+                norm_layer=bn_layer,
+                act_layer=act_layer,
+            )
+        else:
+            self.embedding = OriginalEmbedding(
+                in_channels=in_channels,
+                embed_channels=enc_channels[0],
+                norm_layer=bn_layer,
+                act_layer=act_layer,
+            )
 
         # encoder
         enc_drop_path = [
@@ -1527,6 +1561,7 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        use_asd_ssm=use_asd_ssm,
                     ),
                     name=f"block{i}",
                 )
@@ -1579,6 +1614,7 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            use_asd_ssm=use_asd_ssm,
                         ),
                         name=f"block{i}",
                     )
