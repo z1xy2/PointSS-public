@@ -163,7 +163,3 @@ This codebase is built upon [Point Transformer V3](https://github.com/Pointcept/
 ## License
 
 This project is released under the MIT License.
-
-## Contact
-
-For questions and discussions, please open an issue or contact [your-email@example.com].
