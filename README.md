@@ -114,11 +114,6 @@ git checkout feature/asd-ssm
 sh scripts/train.sh -d scannet -c your-config -n asd-ssm-exp -g 4
 ```
 
-**GGAM + ASD-SSM + MASA**:
-```bash
-git checkout masa-implementation
-sh scripts/train.sh -d scannet -c your-config -n masa-exp -g 4
-```
 
 ## Testing
 
@@ -138,7 +133,6 @@ Our framework is built upon **Point Transformer V3** with the following key inno
 
 - **GGAM (Global-Guided Attention Module)**: Enhances feature learning with global context guidance
 - **ASD-SSM (Adaptive State Space Module)**: Efficient long-range dependency modeling
-- **MASA**: Multi-scale aggregation for enhanced spatial awareness
 
 Main model code: `pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py`
 
