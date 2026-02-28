@@ -4,14 +4,14 @@
 
 >  This is a preview release for paper review purposes. The complete model implementation will be released upon paper acceptance.
 
-This repository contains the implementation of our point cloud semantic segmentation framework PointSS, incorporating two novel modules: Global-Guided Attention Module (GGAM) and Adaptive State Space Module (ASD-SSM) with MASA enhancement. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including  S3DIS, and ModelNet40.
+This repository contains the implementation of our point cloud semantic segmentation framework PointSS. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including  S3DIS.
 
 
 ## Installation
 
 ### Requirements
 - Ubuntu 18.04 or above
-- CUDA 11.3 or above (CUDA 11.6+ recommended for Flash Attention)
+- CUDA 11.3 or above
 - PyTorch 1.10.0 or above
 - Python 3.8+
 
@@ -51,7 +51,6 @@ pip install spconv-cu118  # for CUDA 11.8
 ```bash
 pip install flash-attn --no-build-isolation
 ```
-*Note: If Flash Attention cannot be installed, set `enable_flash=False` in model config.*
 
 ## Data Preparation
 
@@ -110,7 +109,6 @@ sh scripts/train.sh -p python -d scannet -c semseg-pt-v3m1-0-base -n exp_name -g
 
 **GGAM + ASD-SSM** (main branch):
 ```bash
-git checkout feature/asd-ssm
 sh scripts/train.sh -d scannet -c your-config -n asd-ssm-exp -g 4
 ```
 
