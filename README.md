@@ -150,10 +150,9 @@ If you find this work helpful, please consider citing:
 
 ```bibtex
 @article{pointss2024,
-  title={Point Cloud Semantic Segmentation with GGAM and ASD-SSM},
-  author={Your Name},
-  journal={Your Journal},
-  year={2024}
+  title={PointSS},
+  author={XinWang,Xinyuan Zhang},
+  year={2026}
 }
 ```
 
