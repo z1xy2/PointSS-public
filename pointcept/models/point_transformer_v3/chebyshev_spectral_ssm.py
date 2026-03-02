@@ -258,14 +258,10 @@ class SerializedWindowGraphBuilder(nn.Module):
             # 广播构建邻居矩阵 [B, k]
             neighbor_idx = center_idx.unsqueeze(1) + offsets.unsqueeze(0)
 
-            # 2. 边界处理
-            neighbor_idx = torch.clamp(neighbor_idx, 0, batch_size - 1)
-
-            # 3. 创建有效性mask
+            # 2. 创建有效性mask，过滤越界索引
             valid_mask = (neighbor_idx >= 0) & (neighbor_idx < batch_size)
-            valid_mask &= (neighbor_idx != center_idx.unsqueeze(1))  # 排除自连接
 
-            # 4. 构建边（向量化）
+            # 3. 构建边（向量化）
             centers_repeated = center_idx.unsqueeze(1).expand(-1, k)  # [B, k]
             valid_centers = centers_repeated[valid_mask]  # [E']
             valid_neighbors = neighbor_idx[valid_mask]  # [E']
@@ -293,7 +289,7 @@ class SerializedWindowGraphBuilder(nn.Module):
                 torch.cat(all_edges_row),
                 torch.cat(all_edges_col)
             ], dim=0)  # [2, E]
-
+            #  一个batch内的每个样本的边都存在这里，用的是一批batch内的全局索引
             distances_all = torch.cat(all_weights)
 
             # 高斯核权重
