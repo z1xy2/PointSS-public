@@ -85,42 +85,46 @@ class ASDSSMWrapper(nn.Module):
     ```
     """
 
-    def __init__(self, channels, num_scales=3, enable_state_passing_scales=None):
+    def __init__(self, channels, num_scales=3):
         """
         Args:
             channels: 特征通道数
             num_scales: 尺度数量
-            enable_state_passing_scales: 哪些尺度启用状态传递（默认所有尺度启用）
         """
         super().__init__()
         self.channels = channels
         self.num_scales = num_scales
-        # 🆕 默认所有尺度都启用状态传递
-        if enable_state_passing_scales is None:
-            enable_state_passing_scales = list(range(num_scales))
-        self.enable_state_passing_scales = enable_state_passing_scales
 
-        # 创建多个ASD-Mamba，对应不同的尺度，所有尺度都启用状态传递
+        # 每个尺度对应一个 ASD-Mamba（无patch间状态传递）
         self.asd_mambas = nn.ModuleList([
             AdaptiveScaleDecoupledMamba(
                 d_model=channels,
                 num_scales=num_scales,
                 layer_idx=i,
                 use_global_feature=True,
-                enable_state_passing=(i in enable_state_passing_scales)  # 默认全部启用
+                enable_state_passing=False,
             )
             for i in range(num_scales)
         ])
 
-        # 尺度信息收集器
+        # 尺度信息收集器（默认关闭，需要分析时调用 enable_logging()）
         self.scale_info_history = []
+        self._logging_enabled = False
+
+    def enable_logging(self):
+        """开启 scale_info 收集（调试/分析用），训练时请关闭"""
+        self._logging_enabled = True
+
+    def disable_logging(self):
+        """关闭 scale_info 收集（默认状态）"""
+        self._logging_enabled = False
 
     def forward(self, x, scale_id=0, x_res=None):
         """
-        使用ASD-SSM处理输入，支持patch间状态传递
+        使用ASD-SSM处理输入，所有patch并行处理（无patch间状态传递）
 
         Args:
-            x: (N_patches, L, C) 输入特征，N_patches是patch数量
+            x: (N_patches, L, C) 输入特征
             scale_id: 当前尺度ID
             x_res: 残差
 
@@ -129,38 +133,14 @@ class ASDSSMWrapper(nn.Module):
             x_res: 更新的残差
             scale_info: 尺度信息
         """
-        # 选择对应尺度的Mamba
         scale_id = min(scale_id, self.num_scales - 1)
         asd_mamba = self.asd_mambas[scale_id]
 
-        N_patches, L, C = x.shape
+        # 所有patch一次性并行处理，不传递patch间隐状态
+        x, x_res, h_final, scale_info = asd_mamba(x, scale_id, x_res, h_init=None)
 
-        # 🆕 对于启用状态传递的尺度，逐个patch处理并传递状态
-        if scale_id in self.enable_state_passing_scales and N_patches > 1:
-            outputs = []
-            h_state = None  # 初始隐状态为None
-
-            for i in range(N_patches):
-                # 处理当前patch
-                x_patch = x[i:i+1]  # (1, L, C)
-
-                # 前向传播，传入前一个patch的隐状态
-                out_patch, x_res, h_state, scale_info = asd_mamba(
-                    x_patch, scale_id, x_res, h_init=h_state
-                )
-                outputs.append(out_patch)
-
-                # h_state会自动传递到下一个patch
-
-            # 合并所有patch的输出
-            x = torch.cat(outputs, dim=0)  # (N_patches, L, C)
-
-        else:
-            # 不启用状态传递的尺度，或者只有一个patch，直接处理
-            x, x_res, h_final, scale_info = asd_mamba(x, scale_id, x_res, h_init=None)
-
-        # 收集信息（用于可视化和分析）
-        if self.training:
+        # 收集信息（仅在显式调用 enable_logging() 后才记录，避免影响训练速度）
+        if self._logging_enabled:
             self.scale_info_history.append(scale_info)
 
         return x, x_res, scale_info
@@ -174,7 +154,8 @@ class ASDSSMWrapper(nn.Module):
 
         stats = {}
         for key in self.scale_info_history[0].keys():
-            values = [info[key] for info in self.scale_info_history]
+            values = [info[key].item() if hasattr(info[key], 'item') else info[key]
+                      for info in self.scale_info_history]
             stats[key] = {
                 'mean': sum(values) / len(values),
                 'min': min(values),

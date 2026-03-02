@@ -182,8 +182,7 @@ class SerializedAttention(PointModule):
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        1
-        self.proj = torch.nn.Linear(2 * channels, channels)  # 进行了修改
+        self.proj = torch.nn.Linear(2 * channels, channels)  # 多尺度concat后投影
 
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.mlp = MLP(channels, channels)
@@ -219,28 +218,17 @@ class SerializedAttention(PointModule):
             )
             print(f"🚀 Layer {layer_idx}: Using ASD-SSM with {num_scales} scales")
         else:
-            # 使用原始Mamba
+            # 使用原始 Mamba（双路：有序路径 + 打乱路径）
             self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
                                      bimamba_type='v2',
                                      norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
                                      residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                     drop_path=0)
             self.mamba1 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
                                      bimamba_type='v2',
                                      norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
                                      residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
-            self.mamba2 = MambaBlock(dim=channels, layer_idx=None,
-                                     # mamba_layer_idx存储缓存 而只有_get_states_from_cache用到layer_idx，
-                                     # 但_get_states_from_cache从未执行过,因此layer_idx放心写none。
-                                     bimamba_type='v2',
-                                     norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
-                                     residual_in_fp32=True,
-                                     drop_path=0)  # drop_path就是随机drop，先不drop试试效果
+                                     drop_path=0)
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -438,76 +426,41 @@ class SerializedAttention(PointModule):
         layer_order_prompt = layer_order_prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
         x = torch.cat([layer_order_prompt, x, layer_order_prompt], dim=1)  # 很神奇，将顺序提示当做点给添加进去了，前面六个点，后面六个点，实际都是顺序提示
 
-        # 🆕 使用ASD-SSM或原始Mamba
+        # ========= 路径1：有序序列（细尺度 scale_id=0）=========
         if self.use_asd_ssm:
-            x, x_res, scale_info_0 = self.asd_ssm_wrapper(x, scale_id=0, x_res=x_res)
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=0, x_res=x_res)
         else:
-            x, x_res = self.mamba0(x, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+            x, x_res = self.mamba0(x, x_res)
+        x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]
+        x = x.reshape(-1, C)
+        feat0 = x[inverse]
 
-        x = x[:, self.prompt_num_per_order:-self.prompt_num_per_order]  # 出来时将前后的顺序提示去掉
-        x = x.reshape(-1, C)  # 返回为非patch的情况
-        feat0 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-
-        # =============================引入随机全局特征4================================
-        pad_4, unpad_4, cu_seqlens_4 = self.get_padding_and_inverse(point, K, 1)
-
-        # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
-        order = point.serialized_order[self.order_index][pad_4]
-        inverse = unpad_4[point.serialized_inverse[self.order_index]]
-        ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
-        x = ordered_and_padded_points_feat.reshape(-1, K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        # ========= 路径2：patch内打乱（粗尺度 scale_id=1，patch_size=2K）=========
+        pad_2, unpad_2, _ = self.get_padding_and_inverse(point, 2 * K, 1)
+        order2 = point.serialized_order[self.order_index][pad_2]
+        inverse2 = unpad_2[point.serialized_inverse[self.order_index]]
+        x = point.feat[order2].reshape(-1, 2 * K, C)
         x_res = None
 
-        # 打乱同patch的特征
-        shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()  # 打乱后的下标
-        inverse_shuffle_one_patch_indices = torch.empty_like(shuffle_one_patch_indices)
-        inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(
-            x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
-        x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
+        shuffle_idx = torch.randperm(2 * K, device=x.device)
+        inv_shuffle_idx = torch.empty_like(shuffle_idx)
+        inv_shuffle_idx[shuffle_idx] = torch.arange(2 * K, device=x.device)
+        x = x.index_select(dim=1, index=shuffle_idx)
 
-        # 🆕 使用ASD-SSM或原始Mamba
         if self.use_asd_ssm:
-            x_shuffled, x_res, scale_info_1 = self.asd_ssm_wrapper(
-                x_shuffled, scale_id=1, x_res=x_res
-            )
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=1, x_res=x_res)
         else:
-            x_shuffled, x_res = self.mamba1(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
+            x, x_res = self.mamba1(x, x_res)
 
-        x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
+        x = x.index_select(dim=1, index=inv_shuffle_idx)
+        x = x.reshape(-1, C)
+        feat1 = x[inverse2]
 
-        x = x.reshape(-1, C)  # 返回为非patch的情况
-        feat1 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
+        feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
 
-        # # =============================引入随机全局特征16================================
-        # pad_16, unpad_16, cu_seqlens_16 = self.get_padding_and_inverse(point, 6 * K,2)
-        #
-        # # 取出padding过后的order顺序，可以索引原点云，得到pad后的有序点云
-        # order = point.serialized_order[self.order_index][pad_16]
-        # inverse = unpad_16[point.serialized_inverse[self.order_index]]
-        # ordered_and_padded_points_feat = point.feat[order]  # 排序后和padding后的点云特征。
-        # x = ordered_and_padded_points_feat.reshape(-1, 6 * K, C)  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-        # x_res = None
-        #
-        # # 打乱同patch的特征
-        # shuffle_one_patch_indices = torch.randperm(x.shape[1]).cuda()  # 打乱后的下标
-        # inverse_shuffle_one_patch_indices = torch.empty_like(shuffle_one_patch_indices)
-        # inverse_shuffle_one_patch_indices[shuffle_one_patch_indices] = torch.arange(
-        #     x.shape[1]).cuda()  # 打乱后将点云返还原来顺序，所需的反向下标
-        # x_shuffled = x.index_select(dim=1, index=shuffle_one_patch_indices)
-        #
-        # x_shuffled, x_res = self.mamba2(x_shuffled, x_res)  # todo：看x_res如何修改,这个不好改，还要在下采样里改，先不改试试。
-        # x = x_shuffled.index_select(dim=1, index=inverse_shuffle_one_patch_indices)
-        #
-        # x = x.reshape(-1, C)  # 返回为非patch的情况
-        # feat2 = x[inverse]  # 将排好序和pad的点云转换为最初点云的顺序（没排序没pad）
-
-        feat = torch.concat([feat0, feat1], 1)
-
-        # ffn
+        # proj + mlp
         feat = self.proj(feat)
-
         feat = self.mlp(feat)
-
         feat = self.proj_drop(feat)
         point.feat = feat
         return point
@@ -572,6 +525,7 @@ class Block(PointModule):
             chebyshev_K=3,  # 🆕
             window_size=128,  # 🆕
             spectral_k_neighbors=16,  # 🆕
+            use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
     ):
         super().__init__()
         self.channels = channels
@@ -616,6 +570,7 @@ class Block(PointModule):
             chebyshev_K=chebyshev_K,  # 🆕
             window_size=window_size,  # 🆕
             spectral_k_neighbors=spectral_k_neighbors,  # 🆕
+            use_asd_ssm=use_asd_ssm,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -638,15 +593,8 @@ class Block(PointModule):
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
-        # x, x_res = self.mamba(x, x_res)
 
-        time_start = datetime.datetime.now()
         point = self.attn(point)
-        time_end = datetime.datetime.now()
-        time_latecy = time_end - time_start
-
-        self.count += 1
-        # self.latecyLogger.info(time_latecy)
 
         point = self.drop_path(point)
         point.feat = shortcut + point.feat
@@ -1404,12 +1352,42 @@ class DualSerializedNeighborhoodGeometricEnhancement(nn.Module):
         return enhanced_coords, enhanced_geom, attention_info
 
 
-class Embedding(nn.Module):
+class OriginalEmbedding(PointModule):
     """
-    集成双序列化几何增强的优化嵌入层
+    PTv3 原版 Embedding（SubMConv3d，use_ggam=False 时使用）
     """
 
-    def __init__(self, in_channels, embed_channels, k=16, norm_layer=None, act_layer=None,
+    def __init__(self, in_channels, embed_channels, norm_layer=None, act_layer=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_channels = embed_channels
+
+        self.stem = PointSequential(
+            conv=spconv.SubMConv3d(
+                in_channels,
+                embed_channels,
+                kernel_size=5,
+                padding=1,
+                bias=False,
+                indice_key="stem",
+            )
+        )
+        if norm_layer is not None:
+            self.stem.add(norm_layer(embed_channels), name="norm")
+        if act_layer is not None:
+            self.stem.add(act_layer(), name="act")
+
+    def forward(self, point: Point):
+        point = self.stem(point)
+        return point
+
+
+class GGAMEmbedding(nn.Module):
+    """
+    GGAM Embedding：集成双序列化几何增强的嵌入层（use_ggam=True 时使用）
+    """
+
+    def __init__(self, in_channels, embed_channels, k=64, norm_layer=None, act_layer=None,
                  fusion_strategy='adaptive'):
         super().__init__()
         self.in_channels = in_channels
@@ -1441,10 +1419,6 @@ class Embedding(nn.Module):
             self.act = nn.Identity()
 
     def forward(self, point):
-        """
-        Args:
-            point: Point对象（需要包含Z-order和Hilbert两种序列化顺序）
-        """
         # 1. 双序列化几何增强
         enhanced_coords, enhanced_geom, attention_info = self.dual_geom_enhancer(point)
 
@@ -1452,7 +1426,6 @@ class Embedding(nn.Module):
         if hasattr(point, 'feat') and point.feat is not None:
             combined_feat = torch.cat([point.feat, enhanced_geom], dim=-1)
         else:
-            # 如果没有原始特征，使用坐标作为基础特征
             combined_feat = torch.cat([point.coord, enhanced_geom], dim=-1)
 
         # 3. 特征融合
@@ -1471,6 +1444,10 @@ class Embedding(nn.Module):
             point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
 
         return point
+
+
+# 保留别名，兼容旧代码
+Embedding = GGAMEmbedding
 
 
 @MODELS.register_module("PT-v3m1")
@@ -1507,6 +1484,8 @@ class PointTransformerV3(PointModule):
             pdnorm_adaptive=False,
             pdnorm_affine=True,
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            use_ggam=True,       # 是否使用GGAM Embedding（False=原版SubMConv3d Embedding）
+            use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
             use_geometry_semantic=False,  # 🆕 是否使用Geometry-Semantic Dual-Path SSM
             geometry_k=16,  # 🆕 几何特征提取的邻域大小
             use_chebyshev_spectral=False,  # 🆕 是否使用Chebyshev Spectral SSM
@@ -1556,12 +1535,20 @@ class PointTransformerV3(PointModule):
         # activation layers
         act_layer = nn.GELU
 
-        self.embedding = Embedding(
-            in_channels=in_channels,
-            embed_channels=enc_channels[0],
-            norm_layer=bn_layer,
-            act_layer=act_layer,
-        )
+        if use_ggam:
+            self.embedding = GGAMEmbedding(
+                in_channels=in_channels,
+                embed_channels=enc_channels[0],
+                norm_layer=bn_layer,
+                act_layer=act_layer,
+            )
+        else:
+            self.embedding = OriginalEmbedding(
+                in_channels=in_channels,
+                embed_channels=enc_channels[0],
+                norm_layer=bn_layer,
+                act_layer=act_layer,
+            )
 
         # encoder
         enc_drop_path = [
@@ -1616,6 +1603,7 @@ class PointTransformerV3(PointModule):
                         chebyshev_K=chebyshev_K,  # 🆕
                         window_size=window_size,  # 🆕
                         spectral_k_neighbors=spectral_k_neighbors,  # 🆕
+                        use_asd_ssm=use_asd_ssm,
                     ),
                     name=f"block{i}",
                 )
@@ -1674,6 +1662,7 @@ class PointTransformerV3(PointModule):
                             chebyshev_K=chebyshev_K,  # 🆕
                             window_size=window_size,  # 🆕
                             spectral_k_neighbors=spectral_k_neighbors,  # 🆕
+                            use_asd_ssm=use_asd_ssm,
                         ),
                         name=f"block{i}",
                     )

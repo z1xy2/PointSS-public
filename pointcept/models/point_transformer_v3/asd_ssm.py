@@ -51,26 +51,21 @@ class ScaleAwareParameterGenerator(nn.Module):
         # 尺度编码（可学习的尺度嵌入）
         self.scale_embedding = nn.Embedding(num_scales, d_model // 4)
 
-        # 参数生成网络 - 生成 ΔA, ΔB, ΔC 的偏移量
+        # 参数生成网络 - 只生成 Ā_s（论文公式：Ā_s = α_s · σ(0.1·MLP(...))）
         self.param_generator = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, d_model * 3)  # 生成 ΔA, ΔB, ΔC
+            nn.Linear(d_model, d_model)  # 只生成 Ā_s^raw，sigmoid后乘α_s
         )
 
-        # 尺度约束因子：控制不同尺度的状态衰减速度
-        # 粗尺度（idx=0）: 0.9 → 状态衰减慢，保留长程信息
-        # 细尺度（idx=num_scales-1）: 0.3 → 状态衰减快，快速响应局部变化
+        # 尺度约束因子：细→粗 单调递增（论文：α_1=0.3, α_2=0.9）
         self.register_buffer(
             'scale_constraints',
-            torch.linspace(0.9, 0.3, num_scales)
+            torch.linspace(0.3, 0.9, num_scales)
         )
-
-        # 参数标准化
-        self.param_norm = nn.LayerNorm(d_model)
 
     def forward(self, features, scale_id):
         """
@@ -81,13 +76,8 @@ class ScaleAwareParameterGenerator(nn.Module):
             scale_id: int, 尺度索引 (0=粗尺度, num_scales-1=细尺度)
 
         Returns:
-            delta_A: (N, C) A矩阵的偏移量
-            delta_B: (N, C) B矩阵的偏移量
-            delta_C: (N, C) C矩阵的偏移量
-            scale_info: dict 包含尺度相关信息（用于可视化和分析）
-
-            delta_A、delta_B、delta_C、delta_t三者本源都是由condition通过MLP生成，condition又是由每个patch的整体特征global_feat（池化）和尺度编码拼接而成（可学习的参数，区别不同尺度，相当于尺度的可学习表示）
-            特别的，delta_A，delta_t根据尺度被做了约束，尺度越大，delta_t时间步越大，尺度越大，delta_A偏移量也越大。
+            A_bar: (N, C) 尺度特定的状态转移矩阵，∈ [0, α_s]
+            scale_info: dict 包含尺度相关信息
         """
         N, L, C = features.shape
         device = features.device
@@ -111,29 +101,22 @@ class ScaleAwareParameterGenerator(nn.Module):
         else:
             condition = scale_emb  # (N, C//4)
 
-        # 4. 生成参数偏移量
-        param_offsets = self.param_generator(condition)  # (N, C*3)
-        delta_A, delta_B, delta_C = torch.chunk(param_offsets, 3, dim=-1)
-
-        # 5. 应用尺度约束到 delta_A（关键：控制状态衰减速度）
+        # 4. 生成 Ā_s^raw，再应用 sigmoid + α_s 约束
+        # 论文公式：Ā_s = α_s · σ(λ · MLP([f_global ∥ e_s]))，λ=0.1
+        A_bar_raw = self.param_generator(condition)  # (N, C)
         scale_constraint = self.scale_constraints[scale_id]
-        delta_A = self.param_norm(delta_A)  # 归一化
-        delta_A = delta_A * scale_constraint  # 应用尺度约束
+        A_bar = scale_constraint * torch.sigmoid(0.1 * A_bar_raw)  # ∈ [0, α_s]，始终非负
 
-        # 6. 归一化其他参数
-        delta_B = self.param_norm(delta_B)
-        delta_C = self.param_norm(delta_C)
-
-        # 7. 收集尺度信息（用于分析和可视化）
+        # 5. 收集尺度信息
         scale_info = {
             'scale_id': scale_id,
-            'scale_constraint': scale_constraint.item(),
-            'delta_A_mean': delta_A.mean().item(),
-            'delta_A_std': delta_A.std().item(),
-            'global_feat_norm': global_feat.norm(dim=-1).mean().item() if self.use_global_feature else 0.0
+            'scale_constraint': scale_constraint,
+            'A_bar_mean': A_bar.mean(),
+            'A_bar_std': A_bar.std(),
+            'global_feat_norm': global_feat.norm(dim=-1).mean() if self.use_global_feature else 0.0
         }
 
-        return delta_A, delta_B, delta_C, scale_info
+        return A_bar, scale_info
 
 
 class AdaptiveScaleDecoupledMamba(nn.Module):
@@ -198,48 +181,27 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
             h_final: (N, C) 最终隐状态（用于传递给下一个patch）
             scale_info: 尺度信息字典
         """
-        # 1. 生成尺度特定的参数偏移
-        delta_A, delta_B, delta_C, scale_info = self.param_generator(
-            x, scale_id
-        )
+        # 1. 生成 Ā_s（论文公式）
+        A_bar, scale_info = self.param_generator(x, scale_id)
 
-        # 2. 将参数偏移应用到输入特征
-        # 这里采用特征调制而非直接修改Mamba内部参数（更易实现）
-        # 理论上等价于修改SSM参数矩阵
-        # 前面已有LayerNorm和scale_constraint确保参数在合理范围内
-        x_modulated = x + delta_B.unsqueeze(1)  # B参数影响输入
+        # 2. 通过基础 BiMamba 处理（B、C 使用 Mamba 内部 selective 机制）
+        output, x_res = self.base_mamba(x, x_res)
 
-        # 🆕 3. 直接传递状态（无门控）
-        # 论文公式：h_0^(s,m) = h_P^(s,m-1)
-        # 将前一个patch的最终状态直接作为当前patch的初始状态
-        if self.enable_state_passing and h_init is not None:
-            # 直接将前一个patch的隐状态添加到第一个时间步
-            # 这等价于SSM状态更新：h_1 = A*h_0 + B*u_1，其中h_0 = h_init
-            x_modulated[:, 0, :] = x_modulated[:, 0, :] + h_init
+        # 3. 用 Ā_s 调制输出（近似实现状态衰减控制）
+        # fine scale: A_bar ∈ [0, 0.3] → 轻微增强（快衰减，关注局部）
+        # coarse scale: A_bar ∈ [0, 0.9] → 较强增强（慢衰减，保留全局）
+        output = output * (1.0 + A_bar.unsqueeze(1))
 
-            scale_info['state_passing_enabled'] = True
-        else:
-            scale_info['state_passing_enabled'] = False
-
-        # 4. 通过基础Mamba处理
-        output, x_res = self.base_mamba(x_modulated, x_res)
-
-        # 5. 应用A和C参数的调制
-        # A参数影响状态演化（通过调制输出实现）
-        # C参数影响输出投影
-        output = output * (1.0 + delta_A.unsqueeze(1) * 0.1)  # 0.1是缩放因子，防止变化过大
-        output = output + delta_C.unsqueeze(1) * 0.1
-
-        # 6. 残差连接
+        # 4. BiMamba 内部残差
         if x_res is not None:
             output = output + self.residual_weight * x_res
 
-        # 🆕 7. 提取最终隐状态（最后一个时间步的输出作为隐状态）
-        h_final = output[:, -1, :].clone()  # (N, C)
+        # 5. 提取最终隐状态（保留接口，h_init 不再使用）
+        h_final = output[:, -1, :].clone()
 
-        # 8. 添加输出统计到scale_info
-        scale_info['output_norm'] = output.norm(dim=-1).mean().item()
-        scale_info['h_final_norm'] = h_final.norm(dim=-1).mean().item()
+        scale_info['output_norm'] = output.norm(dim=-1).mean()
+        scale_info['h_final_norm'] = h_final.norm(dim=-1).mean()
+        scale_info['state_passing_enabled'] = False
 
         return output, x_res, h_final, scale_info
 
