@@ -44,8 +44,11 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-        use_ggam=True,      # GGAM Embedding（False=原版SubMConv3d）
-        use_asd_ssm=True,   # ASD-SSM（False=原版Mamba）
+        use_ggam=False,                 # GGAM Embedding 关闭
+        use_asd_ssm=True,               # ASD-SSM 开启
+        use_chebyshev_spectral=True,    # 频域模块 开启（combined模式：与ASD-SSM并行融合）
+        chebyshev_K=3,                  # Chebyshev多项式阶数
+        spectral_k_neighbors=16,        # 频谱图邻居数
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
