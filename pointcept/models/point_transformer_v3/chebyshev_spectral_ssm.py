@@ -275,10 +275,14 @@ class SerializedWindowGraphBuilder(nn.Module):
             neighbor_coords = batch_coords[valid_neighbors]  # [E', 3]
             distances = torch.norm(center_coords - neighbor_coords, dim=1)  # [E']
 
+            # per-batch 高斯核权重，sigma 用当前 batch 的均值距离自适应估计
+            sigma = distances.mean() + 1e-8
+            weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))
+
             # 累积
             all_edges_row.append(edge_row)
             all_edges_col.append(edge_col)
-            all_weights.append(distances)
+            all_weights.append(weights)
 
         # 合并所有batch
         if len(all_edges_row) == 0:
@@ -290,11 +294,7 @@ class SerializedWindowGraphBuilder(nn.Module):
                 torch.cat(all_edges_col)
             ], dim=0)  # [2, E]
             #  一个batch内的每个样本的边都存在这里，用的是一批batch内的全局索引
-            distances_all = torch.cat(all_weights)
-
-            # 高斯核权重
-            sigma = distances_all.median() + 1e-8
-            edge_weight = torch.exp(-distances_all ** 2 / (2 * sigma ** 2))
+            edge_weight = torch.cat(all_weights)
 
         # 恢复到原始顺序
         if edge_index.shape[1] > 0:
