@@ -392,11 +392,14 @@ class ChebyshevSpectralSSM(nn.Module):
         # 输入归一化
         self.norm_input = nn.LayerNorm(d_model)
 
-        # 🆕 融合层：x + 多频段特征
+        # 🆕 融合层：x + 多频段特征（2层MLP）
         self.fusion = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
             nn.Dropout(dropout)
         )
 
@@ -446,14 +449,23 @@ class ChebyshevSpectralSSM(nn.Module):
         # ===== 3. K个Mamba并行处理K个频段 =====
         freq_outputs = []
 
+        # 预计算序列化顺序和逆序列化顺序
+        inverse_order = torch.argsort(spatial_order)
+
         for k in range(self.cheb_K):
             # 获取第k个频段的特征
             x_freq_k = Tx_list[k]  # [N, D]
 
-            # 🆕 第k个Mamba处理第k个频段（不排序）
-            x_freq_k = x_freq_k.unsqueeze(0)  # [1, N, D]
-            x_freq_k_out, _ = self.frequency_mambas[k](x_freq_k, residual=None)
+            # 按序列化顺序重排（Hilbert/Z-order）
+            x_freq_k_seq = x_freq_k[spatial_order]  # [N, D]
+
+            # 🆕 第k个Mamba处理第k个频段（序列化顺序）
+            x_freq_k_seq = x_freq_k_seq.unsqueeze(0)  # [1, N, D]
+            x_freq_k_out, _ = self.frequency_mambas[k](x_freq_k_seq, residual=None)
             x_freq_k_out = x_freq_k_out.squeeze(0)  # [N, D]
+
+            # 逆序列化恢复原始顺序
+            x_freq_k_out = x_freq_k_out[inverse_order]  # [N, D]
 
             # 归一化
             x_freq_k_out = self.freq_norms[k](x_freq_k_out)
