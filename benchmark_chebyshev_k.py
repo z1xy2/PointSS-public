@@ -4,15 +4,10 @@ Chebyshev多项式阶数K消融实验 - 推理时间与参数量测试
 用法：
     python benchmark_chebyshev_k.py
 
-测试内容：
-    对K=1,2,3,4,5分别测量：
-    1. ChebyshevSpectralSSM模块的参数量
-    2. 单次前向推理时间（ms）
-
-注意：
-    - 使用CUDA Event计时，比time.time()更精确
-    - 包含warmup阶段，排除首次运行的编译开销
-    - 模拟S3DIS典型场景的点数规模
+按实际模型配置测量：
+    - 编码器各level的通道数和点数不同
+    - Chebyshev在前3个编码层启用（论文设定），共6个block
+    - 参数量以"全模型占比"形式报告
 """
 
 import torch
@@ -29,131 +24,130 @@ from pointcept.models.point_transformer_v3.chebyshev_spectral_ssm import (
 
 
 def count_parameters(module: nn.Module) -> int:
-    """统计可训练参数量"""
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
 
-def benchmark_single_k(
-    K: int,
-    d_model: int = 256,
-    num_points: int = 80000,
-    k_neighbors: int = 16,
-    num_warmup: int = 10,
-    num_runs: int = 50,
-):
-    """
-    测试单个K值的推理时间和参数量
+# 模型配置（与 semseg-pt-v3m1-0-test.py 一致）
+# 论文设定：前3个编码层启用Chebyshev
+LEVEL_CONFIGS = [
+    # (channels, num_blocks, approx_points)
+    # stride=(2,2,2,2), 起始约80000点
+    (32,  2, 80000),   # enc level 0
+    (64,  2, 40000),   # enc level 1
+    (128, 2, 20000),   # enc level 2
+]
 
-    Args:
-        K: Chebyshev多项式阶数
-        d_model: 特征维度（与模型配置一致）
-        num_points: 点数（模拟S3DIS单场景）
-        k_neighbors: 邻居数
-        num_warmup: warmup次数
-        num_runs: 正式测试次数
-    """
+K_NEIGHBORS = 16
+NUM_WARMUP = 10
+NUM_RUNS = 50
+
+
+def benchmark_k(K: int):
+    """测试单个K值：在所有启用Chebyshev的level上分别测量，然后求和"""
     device = torch.device("cuda")
 
-    # 构建模块
-    model = ChebyshevSpectralSSM(
-        d_model=d_model,
-        cheb_K=K,
-        window_size=128,
-        k_neighbors=k_neighbors,
-        d_state=16,
-        dropout=0.0,
-    ).to(device)
-    model.eval()
+    total_params = 0
+    total_time = 0.0
 
-    params = count_parameters(model)
+    for channels, num_blocks, num_points in LEVEL_CONFIGS:
+        # 每个level的Chebyshev模块（同一level内各block共享相同配置）
+        model = ChebyshevSpectralSSM(
+            d_model=channels,
+            cheb_K=K,
+            window_size=128,
+            k_neighbors=K_NEIGHBORS,
+            d_state=16,
+            dropout=0.0,
+        ).to(device)
+        model.eval()
 
-    # 模拟输入数据（单batch）
-    coords = torch.randn(num_points, 3, device=device)
-    features = torch.randn(num_points, d_model, device=device)
-    offset = torch.tensor([num_points], dtype=torch.long, device=device)
-    spatial_order = torch.randperm(num_points, device=device)
+        level_params = count_parameters(model)
+        total_params += level_params * num_blocks
 
-    # Warmup
-    with torch.no_grad():
-        for _ in range(num_warmup):
-            _ = model(features, coords, offset, spatial_order)
-    torch.cuda.synchronize()
+        # 模拟输入
+        coords = torch.randn(num_points, 3, device=device)
+        features = torch.randn(num_points, channels, device=device)
+        offset = torch.tensor([num_points], dtype=torch.long, device=device)
+        spatial_order = torch.randperm(num_points, device=device)
 
-    # 正式测试
-    timings = []
-    with torch.no_grad():
-        for _ in range(num_runs):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+        # Warmup
+        with torch.no_grad():
+            for _ in range(NUM_WARMUP):
+                _ = model(features, coords, offset, spatial_order)
+        torch.cuda.synchronize()
 
-            start_event.record()
-            _ = model(features, coords, offset, spatial_order)
-            end_event.record()
+        # 测量单个block的推理时间
+        timings = []
+        with torch.no_grad():
+            for _ in range(NUM_RUNS):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                _ = model(features, coords, offset, spatial_order)
+                end.record()
+                torch.cuda.synchronize()
+                timings.append(start.elapsed_time(end))
 
-            torch.cuda.synchronize()
-            timings.append(start_event.elapsed_time(end_event))  # ms
+        mean_time = np.mean(timings)
+        # 该level有num_blocks个block，每个block调用一次Chebyshev
+        total_time += mean_time * num_blocks
 
-    timings = np.array(timings)
-    mean_time = timings.mean()
-    std_time = timings.std()
+        print(f"    Level (ch={channels}, pts={num_points}): "
+              f"{mean_time:.1f} ms/block x {num_blocks} blocks = {mean_time * num_blocks:.1f} ms")
 
-    # 清理显存
-    del model, coords, features, offset, spatial_order
-    torch.cuda.empty_cache()
+        del model, coords, features, offset, spatial_order
+        torch.cuda.empty_cache()
 
-    return params, mean_time, std_time
+    return total_params, total_time
 
 
 def main():
     K_values = [1, 2, 3, 4, 5]
-    d_model = 256  # 与enc_channels第4层一致
-    num_points = 80000  # S3DIS单场景的典型点数
 
     print("=" * 65)
-    print("Chebyshev多项式阶数K 消融实验 - 推理时间基准测试")
-    print(f"配置: d_model={d_model}, num_points={num_points}")
+    print("Chebyshev 阶数K 消融 - 按实际模型层级配置测量")
+    print(f"启用Chebyshev的层级: {len(LEVEL_CONFIGS)} 层, "
+          f"共 {sum(c[1] for c in LEVEL_CONFIGS)} 个block")
+    print(f"各层: {[(ch, pts) for ch, _, pts in LEVEL_CONFIGS]}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("=" * 65)
 
     results = []
-    # K=1时的参数量作为基准
     base_params = None
 
     for K in K_values:
-        print(f"\n测试 K={K} ...")
-        params, mean_time, std_time = benchmark_single_k(
-            K=K, d_model=d_model, num_points=num_points
-        )
+        print(f"\n--- K={K} ---")
+        cheb_params, cheb_time = benchmark_k(K)
+
         if base_params is None:
-            base_params = params
-        param_ratio = params / base_params
-        results.append((K, param_ratio, mean_time, std_time, params))
-        print(f"  参数量: {params:,} ({param_ratio:.2f}x)")
-        print(f"  推理时间: {mean_time:.1f} +/- {std_time:.1f} ms")
+            base_params = cheb_params
 
-    # 汇总表格
+        param_ratio = cheb_params / base_params
+        results.append((K, param_ratio, cheb_time, cheb_params))
+
+        print(f"  Chebyshev总参数: {cheb_params:,} ({param_ratio:.2f}x)")
+        print(f"  Chebyshev总耗时: {cheb_time:.1f} ms")
+
+    # 汇总
     print("\n" + "=" * 65)
-    print("汇总结果（可直接填入论文表格）")
+    print("汇总（Chebyshev模块的额外开销）")
     print("=" * 65)
-    print(f"{'K':<6} {'参数量':>10} {'推理时间 (ms)':>16} {'mIoU (%)':>10}")
-    print("-" * 45)
-    for K, ratio, mean_t, std_t, _ in results:
+    print(f"{'K':<4} {'参数量(相对K=1)':>16} {'Chebyshev耗时(ms)':>20} {'mIoU':>8}")
+    print("-" * 52)
+    for K, ratio, time_ms, _ in results:
         miou = "TODO" if K != 3 else "70.8"
-        print(f"{K:<6} {ratio:.2f}x{' ':>5} {mean_t:.1f}{' ':>10} {miou:>10}")
+        print(f"{K:<4} {ratio:.2f}x{' ':>12} {time_ms:.1f}{' ':>14} {miou:>8}")
 
-    # LaTeX格式输出
+    # LaTeX
     print("\n" + "=" * 65)
-    print("LaTeX表格行（复制粘贴用）")
+    print("LaTeX表格行")
     print("=" * 65)
-    for K, ratio, mean_t, std_t, _ in results:
+    for K, ratio, time_ms, _ in results:
         miou = r"\textcolor{red}{TODO}" if K != 3 else "70.8"
-        bold = K == 3
-        if bold:
-            print(
-                rf"\textbf{{{K}}} & \textbf{{{ratio:.2f}$\times$}} & \textbf{{{mean_t:.1f}}} & \textbf{{{miou}}} \\"
-            )
+        if K == 3:
+            print(rf"\textbf{{{K}}} & \textbf{{{ratio:.2f}$\times$}} & \textbf{{{time_ms:.1f}}} & \textbf{{{miou}}} \\")
         else:
-            print(rf"{K} & {ratio:.2f}$\times$ & {mean_t:.1f} & {miou} \\")
+            print(rf"{K} & {ratio:.2f}$\times$ & {time_ms:.1f} & {miou} \\")
 
 
 if __name__ == "__main__":
