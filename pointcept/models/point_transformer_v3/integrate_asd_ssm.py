@@ -50,4 +50,4 @@ class ASDSSMWrapper(nn.Module):
             outputs.append(out)
 
         x = torch.cat(outputs, dim=0)
-        return x, x_res
+        return x, x_res, None

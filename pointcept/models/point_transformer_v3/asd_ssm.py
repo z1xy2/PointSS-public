@@ -30,9 +30,10 @@ class ScaleAwareParameterGenerator(nn.Module):
     Eq.(3): Ā_{s,m} = α_s · Â_raw                 ∈ [0, α_s]
     """
 
-    def __init__(self, d_model, num_scales=3, use_global_feature=True):
+    def __init__(self, d_model, num_scales=3, expand=2, use_global_feature=True):
         super().__init__()
         self.d_model = d_model
+        self.d_inner = int(d_model * expand)
         self.num_scales = num_scales
         self.use_global_feature = use_global_feature
         self.temperature = 0.1  # λ
@@ -53,7 +54,7 @@ class ScaleAwareParameterGenerator(nn.Module):
         self.param_generator = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, self.d_inner),
         )
 
         # α_1=0.3 (finest) … α_S=0.9 (coarsest), monotonically increasing
@@ -68,7 +69,7 @@ class ScaleAwareParameterGenerator(nn.Module):
             features: (B, L, C)  patch features
             scale_id: int        scale index (0 = finest, S-1 = coarsest)
         Returns:
-            A_bar: (B, C)  ∈ [0, α_s]
+            A_bar: (B, D_inner)  ∈ [0, α_s]
         """
         B, L, C = features.shape
         device = features.device
@@ -122,8 +123,6 @@ class SelectiveSSMCore(nn.Module):
         self.B_proj = nn.Linear(self.d_inner, d_state, bias=False)
         self.C_proj = nn.Linear(self.d_inner, d_state, bias=False)
 
-        self.A_adapt = nn.Linear(d_model, self.d_inner, bias=False)
-
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     # ------------------------------------------------------------------
@@ -164,7 +163,7 @@ class SelectiveSSMCore(nn.Module):
         """
         Args:
             x:      (B, L, D_model)
-            A_bar:  (B, D_model)      from ScaleAwareParameterGenerator
+            A_bar:  (B, D_inner)      from ScaleAwareParameterGenerator, ∈ [0, α_s]
             h_init: (B, D_inner, N)   optional initial hidden state
         Returns:
             y:       (B, L, D_model)
@@ -180,7 +179,7 @@ class SelectiveSSMCore(nn.Module):
         B = self.B_proj(x_branch)
         C = self.C_proj(x_branch)
 
-        A_inner = torch.sigmoid(self.A_adapt(A_bar))
+        A_inner = A_bar
 
         if HAS_CUDA_SCAN and not torch.is_grad_enabled():
             y, h_final = self._scan_cuda(x_branch, A_inner, B, C, h_init)
@@ -223,7 +222,7 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
     def __init__(self, d_model, num_scales=3, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.d_model = d_model
-        self.param_gen = ScaleAwareParameterGenerator(d_model, num_scales)
+        self.param_gen = ScaleAwareParameterGenerator(d_model, num_scales, expand)
         self.bi_ssm = BidirectionalASDSSM(d_model, d_state, d_conv, expand)
         self.norm = RMSNorm(d_model, eps=1e-5)
 
