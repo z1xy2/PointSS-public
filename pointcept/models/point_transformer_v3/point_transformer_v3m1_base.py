@@ -38,6 +38,12 @@ from pointcept.models.utils.serialization import encode, decode
 # 🆕 导入ASD-SSM模块
 from .integrate_asd_ssm import ASDSSMWrapper
 
+# 🆕 导入Geometry-Semantic Dual-Path SSM模块
+from .geometry_semantic_dual_path import GeometrySemanticDualPathSSM
+
+# 🆕 导入Chebyshev Spectral SSM模块
+from .chebyshev_spectral_ssm import ChebyshevSpectralSSM
+
 
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
@@ -124,8 +130,12 @@ class SerializedAttention(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             area_num=2,
-            use_asd_ssm=True,  # 🆕 控制是否使用ASD-SSM
-            num_scales=2,      # 🆕 ASD-SSM的尺度数量
+            use_asd_ssm=False,  # 🆕 控制是否使用ASD-SSM
+            num_scales=3,       # 🆕 ASD-SSM的尺度数量 (S=3: F1=1, F2=2, F3=4)
+            use_chebyshev_spectral=False,  # 🆕 控制是否使用Chebyshev Spectral SSM
+            chebyshev_K=3,      # 🆕 Chebyshev多项式阶数
+            window_size=128,    # 🆕 窗口大小
+            spectral_k_neighbors=16,  # 🆕 频谱图的邻居数
 
     ):
         super().__init__()
@@ -143,6 +153,7 @@ class SerializedAttention(PointModule):
         self.area_num = area_num
         self.use_asd_ssm = use_asd_ssm  # 🆕 保存配置
         self.num_scales = num_scales    # 🆕 保存尺度数量
+        self.use_chebyshev_spectral = use_chebyshev_spectral  # 🆕 保存配置
 
         if enable_flash:
             assert (
@@ -168,21 +179,38 @@ class SerializedAttention(PointModule):
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        self.proj = torch.nn.Linear(2 * channels, channels)  # 多尺度concat后投影
+        # 多尺度 concat 后投影: ASD-SSM 3 尺度 → 3C, 其他 2 路 → 2C
+        concat_scales = num_scales if use_asd_ssm else 2
+        self.proj = torch.nn.Linear(concat_scales * channels, channels)
 
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.mlp = MLP(channels, channels)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
 
-        # 🆕 根据配置选择使用原始Mamba或ASD-SSM
+        # 🆕 根据配置选择使用原始Mamba、ASD-SSM、Geometry-Semantic或Chebyshev Spectral
+        # 🆕 频域模块初始化（如果启用）
+        if use_chebyshev_spectral:
+            self.chebyshev_spectral_ssm = ChebyshevSpectralSSM(
+                d_model=channels,
+                cheb_K=chebyshev_K,
+                window_size=window_size,
+                k_neighbors=spectral_k_neighbors,
+                d_state=16,
+                dropout=0.0
+            )
+            self.spectral_fusion = nn.Linear(2 * channels, channels)  # 统一的频域融合层
+
+        # 🆕 时域模块初始化
         if use_asd_ssm:
-            # 使用ASD-SSM Wrapper
             self.asd_ssm_wrapper = ASDSSMWrapper(
                 channels=channels,
                 num_scales=num_scales
             )
-            print(f"🚀 Layer {layer_idx}: Using ASD-SSM with {num_scales} scales")
+            if use_chebyshev_spectral:
+                print(f"⚡🚀 Layer {layer_idx}: ASD-SSM (时域) + Chebyshev (频域) 融合模式")
+            else:
+                print(f"🚀 Layer {layer_idx}: ASD-SSM only")
         else:
             # 使用原始 Mamba（双路：有序路径 + 打乱路径）
             self.mamba0 = MambaBlock(dim=channels, layer_idx=None,
@@ -195,6 +223,10 @@ class SerializedAttention(PointModule):
                                      norm_cls=partial(RMSNorm, eps=1e-5, ), fused_add_norm=True,
                                      residual_in_fp32=True,
                                      drop_path=0)
+            if use_chebyshev_spectral:
+                print(f"⚡ Layer {layer_idx}: Vanilla Mamba (时域) + Chebyshev (频域) 融合模式")
+            else:
+                print(f"🔵 Layer {layer_idx}: Vanilla Mamba only")
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -326,6 +358,14 @@ class SerializedAttention(PointModule):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
+        # 🆕 保存原始特征（如果需要频域融合）
+        if self.use_chebyshev_spectral:
+            original_feat = point.feat
+            original_coord = point.coord
+            original_offset = point.offset
+            spatial_order = point.serialized_order[self.order_index]
+
+        # Mamba/ASD-SSM 双路流程
         if not self.enable_flash:
             self.current_patch_size = min(
                 offset2bincount(point.offset).min().tolist(), self.patch_size_max
@@ -370,7 +410,7 @@ class SerializedAttention(PointModule):
         x = x.reshape(-1, C)
         feat0 = x[inverse]
 
-        # ========= 路径2：patch内打乱（粗尺度 scale_id=1，patch_size=2K）=========
+        # ========= 路径2：patch内打乱（中间尺度 scale_id=1，patch_size=2K）=========
         pad_2, unpad_2, _ = self.get_padding_and_inverse(point, 2 * K, 1)
         order2 = point.serialized_order[self.order_index][pad_2]
         inverse2 = unpad_2[point.serialized_inverse[self.order_index]]
@@ -391,12 +431,44 @@ class SerializedAttention(PointModule):
         x = x.reshape(-1, C)
         feat1 = x[inverse2]
 
-        feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
+        # ========= 路径3：patch内打乱（粗尺度 scale_id=2，patch_size=4K）=========
+        if self.use_asd_ssm:
+            pad_4, unpad_4, _ = self.get_padding_and_inverse(point, 4 * K, 2)
+            order4 = point.serialized_order[self.order_index][pad_4]
+            inverse4 = unpad_4[point.serialized_inverse[self.order_index]]
+            x = point.feat[order4].reshape(-1, 4 * K, C)
+            x_res = None
+
+            shuffle_idx_4 = torch.randperm(4 * K, device=x.device)
+            inv_shuffle_idx_4 = torch.empty_like(shuffle_idx_4)
+            inv_shuffle_idx_4[shuffle_idx_4] = torch.arange(4 * K, device=x.device)
+            x = x.index_select(dim=1, index=shuffle_idx_4)
+
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=2, x_res=x_res)
+
+            x = x.index_select(dim=1, index=inv_shuffle_idx_4)
+            x = x.reshape(-1, C)
+            feat2 = x[inverse4]
+
+            feat = torch.cat([feat0, feat1, feat2], dim=1)  # (N, 3C)
+        else:
+            feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
 
         # proj + mlp
         feat = self.proj(feat)
         feat = self.mlp(feat)
         feat = self.proj_drop(feat)
+
+        # 🆕 频域融合：时域特征（Mamba/ASD-SSM）+ 频域特征（Chebyshev）
+        if self.use_chebyshev_spectral:
+            feat_spectral = self.chebyshev_spectral_ssm(
+                x=original_feat,
+                coords=original_coord,
+                offset=original_offset,
+                spatial_order=spatial_order
+            )
+            feat = self.spectral_fusion(torch.cat([feat, feat_spectral], dim=1))
+
         point.feat = feat
         return point
 
@@ -454,6 +526,10 @@ class Block(PointModule):
             upcast_attention=True,
             upcast_softmax=True,
             drop_path_rate=0.1,  # 新增
+            use_chebyshev_spectral=False,  # 🆕
+            chebyshev_K=3,  # 🆕
+            window_size=128,  # 🆕
+            spectral_k_neighbors=16,  # 🆕
             use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
     ):
         super().__init__()
@@ -493,6 +569,10 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+            chebyshev_K=chebyshev_K,  # 🆕
+            window_size=window_size,  # 🆕
+            spectral_k_neighbors=spectral_k_neighbors,  # 🆕
             use_asd_ssm=use_asd_ssm,
         )
         self.norm2 = PointSequential(norm_layer(channels))
@@ -1409,6 +1489,10 @@ class PointTransformerV3(PointModule):
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
             use_ggam=True,       # 是否使用GGAM Embedding（False=原版SubMConv3d Embedding）
             use_asd_ssm=True,    # 是否使用ASD-SSM（False=原版Mamba）
+            use_chebyshev_spectral=False,  # 🆕 是否使用Chebyshev Spectral SSM
+            chebyshev_K=3,  # 🆕 Chebyshev多项式阶数
+            window_size=128,  # 🆕 频谱窗口大小
+            spectral_k_neighbors=16,  # 🆕 频谱图的邻居数
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1514,6 +1598,10 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+                        chebyshev_K=chebyshev_K,  # 🆕
+                        window_size=window_size,  # 🆕
+                        spectral_k_neighbors=spectral_k_neighbors,  # 🆕
                         use_asd_ssm=use_asd_ssm,
                     ),
                     name=f"block{i}",
@@ -1567,6 +1655,10 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            use_chebyshev_spectral=use_chebyshev_spectral,  # 🆕
+                            chebyshev_K=chebyshev_K,  # 🆕
+                            window_size=window_size,  # 🆕
+                            spectral_k_neighbors=spectral_k_neighbors,  # 🆕
                             use_asd_ssm=use_asd_ssm,
                         ),
                         name=f"block{i}",
