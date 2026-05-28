@@ -12,7 +12,16 @@ Author: Xinyuan Zhang
 
 import torch
 import torch.nn as nn
-from mamba_ssm.ops.triton.layernorm import RMSNorm
+class RMSNorm(nn.Module):
+    """Simple RMSNorm to avoid mamba_ssm version conflicts."""
+    def __init__(self, d_model, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * norm).type_as(x) * self.weight
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
