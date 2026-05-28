@@ -20,7 +20,7 @@ class ASDSSMWrapper(nn.Module):
     sequence continuity across patch boundaries.
     """
 
-    def __init__(self, channels, num_scales=2):
+    def __init__(self, channels, num_scales=3):
         super().__init__()
         self.channels = channels
         self.num_scales = num_scales

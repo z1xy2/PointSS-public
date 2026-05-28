@@ -131,7 +131,7 @@ class SerializedAttention(PointModule):
             upcast_softmax=True,
             area_num=2,
             use_asd_ssm=False,  # 🆕 控制是否使用ASD-SSM
-            num_scales=2,       # 🆕 ASD-SSM的尺度数量 (S=2: F1=1, F2=2)
+            num_scales=3,       # 🆕 ASD-SSM的尺度数量 (S=3: F1=1, F2=2, F3=4)
             use_chebyshev_spectral=False,  # 🆕 控制是否使用Chebyshev Spectral SSM
             chebyshev_K=3,      # 🆕 Chebyshev多项式阶数
             window_size=128,    # 🆕 窗口大小
@@ -179,8 +179,9 @@ class SerializedAttention(PointModule):
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
         self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        # 多尺度 concat 后投影: 2 尺度 → 2C
-        self.proj = torch.nn.Linear(2 * channels, channels)
+        # 多尺度 concat 后投影: ASD-SSM 3 尺度 → 3C, 其他 2 路 → 2C
+        concat_scales = num_scales if use_asd_ssm else 2
+        self.proj = torch.nn.Linear(concat_scales * channels, channels)
 
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.mlp = MLP(channels, channels)
@@ -430,8 +431,28 @@ class SerializedAttention(PointModule):
         x = x.reshape(-1, C)
         feat1 = x[inverse2]
 
-        # 拼接两个尺度的特征
-        feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
+        # ========= 路径3：patch内打乱（粗尺度 scale_id=2，patch_size=4K）=========
+        if self.use_asd_ssm:
+            pad_4, unpad_4, _ = self.get_padding_and_inverse(point, 4 * K, 2)
+            order4 = point.serialized_order[self.order_index][pad_4]
+            inverse4 = unpad_4[point.serialized_inverse[self.order_index]]
+            x = point.feat[order4].reshape(-1, 4 * K, C)
+            x_res = None
+
+            shuffle_idx_4 = torch.randperm(4 * K, device=x.device)
+            inv_shuffle_idx_4 = torch.empty_like(shuffle_idx_4)
+            inv_shuffle_idx_4[shuffle_idx_4] = torch.arange(4 * K, device=x.device)
+            x = x.index_select(dim=1, index=shuffle_idx_4)
+
+            x, x_res, _ = self.asd_ssm_wrapper(x, scale_id=2, x_res=x_res)
+
+            x = x.index_select(dim=1, index=inv_shuffle_idx_4)
+            x = x.reshape(-1, C)
+            feat2 = x[inverse4]
+
+            feat = torch.cat([feat0, feat1, feat2], dim=1)  # (N, 3C)
+        else:
+            feat = torch.cat([feat0, feat1], dim=1)  # (N, 2C)
 
         # proj + mlp
         feat = self.proj(feat)
