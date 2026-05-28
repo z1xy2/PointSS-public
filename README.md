@@ -2,17 +2,16 @@
 
 **Point Cloud Semantic Segmentation with GGAM and ASD-SSM**
 
-This repository contains the implementation of our point cloud semantic segmentation framework PointSS, incorporating two novel modules: Global-Guided Attention Module (GGAM) and Adaptive State Space Module (ASD-SSM) with MASA enhancement. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including  S3DIS, and ModelNet40.
+>  This is a preview release for paper review purposes. The complete model implementation will be released upon paper acceptance.
 
-## News
-- **[2024-11]** Project code released with GGAM and ASD-SSM modules
-- **[2024-11]** MASA branch implementation completed
+This repository contains the implementation of our point cloud semantic segmentation framework PointSS. Our approach achieves state-of-the-art performance on multiple 3D semantic segmentation benchmarks including  S3DIS.
+
 
 ## Installation
 
 ### Requirements
 - Ubuntu 18.04 or above
-- CUDA 11.3 or above (CUDA 11.6+ recommended for Flash Attention)
+- CUDA 11.3 or above
 - PyTorch 1.10.0 or above
 - Python 3.8+
 
@@ -52,7 +51,6 @@ pip install spconv-cu118  # for CUDA 11.8
 ```bash
 pip install flash-attn --no-build-isolation
 ```
-*Note: If Flash Attention cannot be installed, set `enable_flash=False` in model config.*
 
 ## Data Preparation
 
@@ -111,15 +109,9 @@ sh scripts/train.sh -p python -d scannet -c semseg-pt-v3m1-0-base -n exp_name -g
 
 **GGAM + ASD-SSM** (main branch):
 ```bash
-git checkout feature/asd-ssm
 sh scripts/train.sh -d scannet -c your-config -n asd-ssm-exp -g 4
 ```
 
-**GGAM + ASD-SSM + MASA**:
-```bash
-git checkout masa-implementation
-sh scripts/train.sh -d scannet -c your-config -n masa-exp -g 4
-```
 
 ## Testing
 
@@ -139,7 +131,6 @@ Our framework is built upon **Point Transformer V3** with the following key inno
 
 - **GGAM (Global-Guided Attention Module)**: Enhances feature learning with global context guidance
 - **ASD-SSM (Adaptive State Space Module)**: Efficient long-range dependency modeling
-- **MASA**: Multi-scale aggregation for enhanced spatial awareness
 
 Main model code: `pointcept/models/point_transformer_v3/point_transformer_v3m1_base.py`
 
@@ -157,10 +148,9 @@ If you find this work helpful, please consider citing:
 
 ```bibtex
 @article{pointss2024,
-  title={Point Cloud Semantic Segmentation with GGAM and ASD-SSM},
-  author={Your Name},
-  journal={Your Journal},
-  year={2024}
+  title={PointSS},
+  author={XinWang,Xinyuan Zhang},
+  year={2026}
 }
 ```
 
@@ -171,7 +161,3 @@ This codebase is built upon [Point Transformer V3](https://github.com/Pointcept/
 ## License
 
 This project is released under the MIT License.
-
-## Contact
-
-For questions and discussions, please open an issue or contact [your-email@example.com].
