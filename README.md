@@ -138,9 +138,9 @@ Main model code: `pointcept/models/point_transformer_v3/point_transformer_v3m1_b
 
 | Dataset | mIoU | Config |
 |---------|------|--------|
-| ScanNet | TBD | `configs/scannet/semseg-pt-v3m1-0-base.py` |
-| S3DIS | TBD | `configs/s3dis/semseg-pt-v3m1-0-base.py` |
-| nuScenes | TBD | `configs/nuscenes/semseg-pt-v3m1-0-base.py` |
+| S3DIS (Area 5) | 73.8 | `configs/s3dis/semseg-pt-v3m1-0-base.py` |
+| nuScenes | 81.0 | `configs/nuscenes/semseg-pt-v3m1-0-base.py` |
+| ModelNet40 | 94.6 (OA) | `configs/modelnet40/cls-pt-v3m1-0-base.py` |
 
 ## Citation
 
