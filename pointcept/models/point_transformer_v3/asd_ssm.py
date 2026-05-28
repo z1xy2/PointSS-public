@@ -39,7 +39,7 @@ class ScaleAwareParameterGenerator(nn.Module):
     Eq.(3): Ā_{s,m} = α_s · Â_raw                 ∈ [0, α_s]
     """
 
-    def __init__(self, d_model, num_scales=3, expand=2, use_global_feature=True):
+    def __init__(self, d_model, num_scales=2, expand=2, use_global_feature=True):
         super().__init__()
         self.d_model = d_model
         self.d_inner = int(d_model * expand)
@@ -228,7 +228,7 @@ class AdaptiveScaleDecoupledMamba(nn.Module):
     3. Cross-patch state passing     → h_0^{s,m} = h_P^{s,m-1}
     """
 
-    def __init__(self, d_model, num_scales=3, d_state=16, d_conv=4, expand=2):
+    def __init__(self, d_model, num_scales=2, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.d_model = d_model
         self.param_gen = ScaleAwareParameterGenerator(d_model, num_scales, expand)
